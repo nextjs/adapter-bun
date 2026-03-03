@@ -1,132 +1,8 @@
 import type {
   BunDeploymentManifest,
-  BunFunctionArtifact,
-  BunPrerenderSeed,
-  BunRouteGraph,
-  BunRouterManifest,
   BunStaticAsset,
   BuildCompleteContext,
 } from './types.ts';
-
-type BuildRoute = BuildCompleteContext['routing']['beforeFiles'][number] & {
-  regex?: string;
-};
-
-function cloneRouteHasConditions(route: BuildRoute): BuildRoute['has'] {
-  if (!Array.isArray(route.has)) {
-    return undefined;
-  }
-  return route.has.map((condition) => ({ ...condition }));
-}
-
-function cloneRouteMissingConditions(route: BuildRoute): BuildRoute['missing'] {
-  if (!Array.isArray(route.missing)) {
-    return undefined;
-  }
-  return route.missing.map((condition) => ({ ...condition }));
-}
-
-function hasMissingXNextjsData(
-  missing: BuildRoute['missing']
-): boolean {
-  if (!Array.isArray(missing)) {
-    return false;
-  }
-  return missing.some(
-    (condition) =>
-      condition?.type === 'header' &&
-      typeof condition.key === 'string' &&
-      condition.key.toLowerCase() === 'x-nextjs-data'
-  );
-}
-
-function toSourceRegex(route: BuildRoute): string {
-  if (typeof route.sourceRegex === 'string' && route.sourceRegex.length > 0) {
-    return route.sourceRegex;
-  }
-  if (typeof route.regex === 'string' && route.regex.length > 0) {
-    return route.regex;
-  }
-  if (typeof route.source === 'string' && route.source.length > 0) {
-    return route.source;
-  }
-
-  return '^$';
-}
-
-function normalizeRoute(route: BuildRoute): BuildRoute {
-  const normalized: BuildRoute = {
-    sourceRegex: toSourceRegex(route),
-  };
-
-  if (typeof route.source === 'string' && route.source.length > 0) {
-    normalized.source = route.source;
-  }
-  if (typeof route.destination === 'string') {
-    normalized.destination = route.destination;
-  }
-  if (route.headers && typeof route.headers === 'object') {
-    normalized.headers = { ...route.headers };
-  }
-  if (typeof route.status === 'number') {
-    normalized.status = route.status;
-  }
-  if (route.priority === true) {
-    normalized.priority = true;
-  }
-
-  const hasConditions = cloneRouteHasConditions(route);
-  if (hasConditions) {
-    normalized.has = hasConditions;
-  }
-
-  const missingConditions = cloneRouteMissingConditions(route);
-  if (missingConditions) {
-    normalized.missing = missingConditions;
-  }
-
-  // Skip automatic trailing-slash redirects for data requests. Next's data
-  // fetches should resolve JSON payloads instead of receiving page redirects.
-  const locationHeader =
-    (normalized.headers?.Location ?? normalized.headers?.location) ?? null;
-  if (
-    normalized.priority === true &&
-    typeof normalized.status === 'number' &&
-    normalized.status >= 300 &&
-    normalized.status < 400 &&
-    typeof locationHeader === 'string' &&
-    !hasMissingXNextjsData(normalized.missing)
-  ) {
-    normalized.missing = [
-      ...(normalized.missing ?? []),
-      {
-        type: 'header',
-        key: 'x-nextjs-data',
-      },
-    ];
-  }
-
-  return normalized;
-}
-
-function normalizeRoutes(
-  routes: BuildCompleteContext['routing']['beforeFiles']
-): BuildCompleteContext['routing']['beforeFiles'] {
-  return routes.map((route) => normalizeRoute(route as BuildRoute));
-}
-
-function toRouteGraph(routing: BuildCompleteContext['routing']): BunRouteGraph {
-  return {
-    beforeMiddleware: normalizeRoutes(routing.beforeMiddleware),
-    beforeFiles: normalizeRoutes(routing.beforeFiles),
-    afterFiles: normalizeRoutes(routing.afterFiles),
-    dynamicRoutes: normalizeRoutes(routing.dynamicRoutes),
-    onMatch: normalizeRoutes(routing.onMatch),
-    fallback: normalizeRoutes(routing.fallback),
-    shouldNormalizeNextData: routing.shouldNormalizeNextData,
-    rsc: routing.rsc,
-  };
-}
 
 export function collectOutputPathnames(
   outputs: BuildCompleteContext['outputs']
@@ -148,34 +24,11 @@ export function collectOutputPathnames(
     pathnames.add(outputs.middleware.pathname);
   }
 
-  // @next/routing resolves "/" by exact-matching against the pathnames list.
-  // Pages Router emits the root page as "/index", so we also add "/" so the
-  // route resolver can find it.
   if (pathnames.has('/index') && !pathnames.has('/')) {
     pathnames.add('/');
   }
 
   return [...pathnames].sort((a, b) => a.localeCompare(b));
-}
-
-export function buildRouterManifest({
-  ctx,
-  generatedAt,
-  pathnames,
-}: {
-  ctx: BuildCompleteContext;
-  generatedAt: string;
-  pathnames: string[];
-}): BunRouterManifest {
-  return {
-    schemaVersion: 1,
-    generatedAt,
-    buildId: ctx.buildId,
-    basePath: ctx.config.basePath,
-    i18n: ctx.config.i18n ?? null,
-    pathnames,
-    routeGraph: toRouteGraph(ctx.routing),
-  };
 }
 
 export function buildDeploymentManifest({
@@ -184,10 +37,7 @@ export function buildDeploymentManifest({
   ctx,
   generatedAt,
   pathnames,
-  functionMap,
   staticAssets,
-  prerenderSeeds,
-  routerManifestPath,
   port,
   hostname,
   previewProps,
@@ -197,10 +47,7 @@ export function buildDeploymentManifest({
   ctx: BuildCompleteContext;
   generatedAt: string;
   pathnames: string[];
-  functionMap: BunFunctionArtifact[];
   staticAssets: BunStaticAsset[];
-  prerenderSeeds: BunPrerenderSeed[];
-  routerManifestPath: string;
   port: number;
   hostname: string;
   previewProps?: BunDeploymentManifest['runtime'] extends infer Runtime
@@ -209,14 +56,6 @@ export function buildDeploymentManifest({
       : never
     : never;
 }): BunDeploymentManifest {
-  const nodeFunctions = functionMap.filter(
-    (artifact) => artifact.runtime === 'nodejs'
-  ).length;
-  const edgeFunctions = functionMap.filter(
-    (artifact) => artifact.runtime === 'edge'
-  ).length;
-  const middlewareOutputId = ctx.outputs.middleware?.id ?? null;
-
   return {
     schemaVersion: 1,
     generatedAt,
@@ -238,53 +77,13 @@ export function buildDeploymentManifest({
       port,
       hostname,
     },
-    artifacts: {
-      routerManifestPath,
-      staticRoot: 'static',
-      functionRoot: 'bundle',
-      prerenderSeedRoot: 'prerender-seeds',
-    },
-    routeGraph: toRouteGraph(ctx.routing),
     pathnames,
     runtime: {
-      middlewareOutputId,
       previewProps: previewProps ?? null,
     },
-    functionMap,
     staticAssets,
-    prerenderSeeds,
-    imageConfig: ctx.config.images ? {
-      deviceSizes: ctx.config.images.deviceSizes,
-      imageSizes: ctx.config.images.imageSizes,
-      formats: ctx.config.images.formats as string[],
-      minimumCacheTTL: ctx.config.images.minimumCacheTTL,
-      remotePatterns: ctx.config.images.remotePatterns.map((p) => {
-        if (p instanceof URL) {
-          return {
-            protocol: p.protocol.replace(/:$/, ''),
-            hostname: p.hostname,
-            port: p.port || undefined,
-            pathname: p.pathname !== '/' ? p.pathname : undefined,
-          };
-        }
-        return {
-          protocol: p.protocol,
-          hostname: p.hostname,
-          port: p.port,
-          pathname: p.pathname,
-          search: p.search,
-        };
-      }),
-      localPatterns: ctx.config.images.localPatterns,
-      dangerouslyAllowSVG: ctx.config.images.dangerouslyAllowSVG,
-      qualities: ctx.config.images.qualities,
-    } : undefined,
     summary: {
-      functionsTotal: functionMap.length,
-      nodeFunctions,
-      edgeFunctions,
       staticAssetsTotal: staticAssets.length,
-      prerenderSeedsTotal: prerenderSeeds.length,
     },
   };
 }

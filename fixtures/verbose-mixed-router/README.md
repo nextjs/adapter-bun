@@ -47,12 +47,19 @@ bun --bun next build
 bun bun-dist/server.js
 ```
 
-## Runtime validation
+## Live E2E validation
 
-With the server running:
+Run against a real `bun-dist/server.js` process:
 
 ```bash
-bun run validate:runtime
+bun run build:e2e
+```
+
+Or build/start manually and execute only the assertions:
+
+```bash
+bun --bun next build
+bun run e2e:live
 ```
 
 ## Revalidation endpoints

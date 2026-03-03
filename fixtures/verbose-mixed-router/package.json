@@ -3,10 +3,10 @@
   "private": true,
   "scripts": {
     "build": "bun --bun next build",
-    "build:validate": "bun --bun next build && bun run scripts/validate-runtime.ts",
+    "build:e2e": "bun --bun next build && bun run e2e:live",
+    "e2e:live": "bun run scripts/e2e-live.ts",
     "start": "next start",
-    "typecheck": "tsc --noEmit",
-    "validate:runtime": "bun run scripts/validate-runtime.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "adapter-bun": "file:../..",

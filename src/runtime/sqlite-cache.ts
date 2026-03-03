@@ -6,9 +6,10 @@ import type {
   PrerenderRevalidateTarget,
   PrerenderTagManifestEntry,
   PrerenderTagManifestUpdate,
+  ImageCacheEntry,
+  ImageCacheStore,
 } from './isr.ts';
 import { readCacheTagsFromHeaders } from './isr.ts';
-import type { ImageCacheEntry, ImageCacheStore } from './image.ts';
 
 export interface SqliteCacheOptions {
   dbPath?: string;

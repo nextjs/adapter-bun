@@ -113,7 +113,6 @@ Three mechanisms are supported:
 
 - **`revalidateTag(tag)`** / **`revalidatePath(path)`** from `next/cache` — works inside route handlers and server actions; synced to SQLite via the tag manifest bridge
 - **`res.revalidate(path)`** — pages router ISR; the adapter patches `fetch` to rewrite self-referencing HTTPS calls to HTTP
-- **Manual endpoint** (`/_next/revalidate`) — accepts `POST` with `{ tags, paths }` for external revalidation triggers
 
 ## Project structure
 
@@ -148,11 +147,7 @@ bun run build
 # type-check
 bun run typecheck
 
-# build + run the test fixture
+# run live E2E checks against a real bun-dist server
 cd fixtures/verbose-mixed-router
-bun --bun next build
-bun bun-dist/server.js
-
-# run validation tests (server must be running)
-bun run validate:runtime
+bun run build:e2e
 ```

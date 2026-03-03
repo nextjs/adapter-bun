@@ -24,8 +24,6 @@
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {
-    "@next/routing": "^16.2.0-canary.71",
-    "edge-runtime": "^4.0.1",
     "sharp": "^0.33.0"
   },
   "devDependencies": {

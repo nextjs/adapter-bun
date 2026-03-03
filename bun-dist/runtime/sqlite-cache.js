@@ -1,0 +1,277 @@
+import { Database } from 'bun:sqlite';
+import path from 'node:path';
+import { readCacheTagsFromHeaders } from "./isr.js";
+export const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS prerender_entries (
+  cache_key TEXT PRIMARY KEY,
+  pathname TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  status INTEGER NOT NULL,
+  headers TEXT NOT NULL,
+  body TEXT NOT NULL,
+  body_encoding TEXT NOT NULL DEFAULT 'base64',
+  created_at INTEGER NOT NULL,
+  revalidate_at INTEGER,
+  expires_at INTEGER,
+  cache_query TEXT,
+  cache_headers TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_prerender_pathname ON prerender_entries(pathname);
+
+CREATE TABLE IF NOT EXISTS image_entries (
+  cache_key TEXT PRIMARY KEY,
+  pathname TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  headers TEXT NOT NULL,
+  body TEXT NOT NULL,
+  body_encoding TEXT NOT NULL DEFAULT 'base64',
+  created_at INTEGER NOT NULL,
+  revalidate_at INTEGER,
+  expires_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS tag_manifest (
+  tag TEXT PRIMARY KEY,
+  stale_at INTEGER,
+  expired_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS revalidate_targets (
+  cache_key TEXT PRIMARY KEY,
+  pathname TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  tags TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_targets_pathname ON revalidate_targets(pathname);
+
+CREATE TABLE IF NOT EXISTS revalidate_target_tags (
+  tag TEXT NOT NULL,
+  cache_key TEXT NOT NULL,
+  PRIMARY KEY (tag, cache_key)
+);
+CREATE INDEX IF NOT EXISTS idx_target_tags_tag ON revalidate_target_tags(tag);
+
+CREATE TABLE IF NOT EXISTS revalidate_locks (
+  cache_key TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
+);
+`;
+function unique(values) {
+    return [...new Set(values)];
+}
+export class SqlitePrerenderCacheStore {
+    #db;
+    constructor(db) {
+        this.#db = db;
+    }
+    get(cacheKey) {
+        const row = this.#db
+            .query('SELECT * FROM prerender_entries WHERE cache_key = ?')
+            .get(cacheKey);
+        if (!row)
+            return null;
+        return {
+            cacheKey: row.cache_key,
+            pathname: row.pathname,
+            groupId: row.group_id,
+            status: row.status,
+            headers: JSON.parse(row.headers),
+            body: row.body,
+            bodyEncoding: row.body_encoding,
+            createdAt: row.created_at,
+            revalidateAt: row.revalidate_at,
+            expiresAt: row.expires_at,
+            cacheQuery: row.cache_query
+                ? JSON.parse(row.cache_query)
+                : undefined,
+            cacheHeaders: row.cache_headers
+                ? JSON.parse(row.cache_headers)
+                : undefined,
+        };
+    }
+    set(cacheKey, entry) {
+        const tags = readCacheTagsFromHeaders(entry.headers);
+        this.#db.transaction(() => {
+            this.#db
+                .query(`INSERT OR REPLACE INTO prerender_entries
+           (cache_key, pathname, group_id, status, headers, body, body_encoding,
+            created_at, revalidate_at, expires_at, cache_query, cache_headers)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+                .run(cacheKey, entry.pathname, entry.groupId, entry.status, JSON.stringify(entry.headers), entry.body, entry.bodyEncoding, entry.createdAt, entry.revalidateAt, entry.expiresAt, entry.cacheQuery ? JSON.stringify(entry.cacheQuery) : null, entry.cacheHeaders ? JSON.stringify(entry.cacheHeaders) : null);
+            // Upsert revalidate target
+            this.#db
+                .query(`INSERT OR REPLACE INTO revalidate_targets (cache_key, pathname, group_id, tags)
+           VALUES (?, ?, ?, ?)`)
+                .run(cacheKey, entry.pathname, entry.groupId, JSON.stringify(tags));
+            // Clean old tag associations for this cache key
+            this.#db
+                .query('DELETE FROM revalidate_target_tags WHERE cache_key = ?')
+                .run(cacheKey);
+            // Insert new tag associations
+            if (tags.length > 0) {
+                const insertTag = this.#db.query('INSERT OR IGNORE INTO revalidate_target_tags (tag, cache_key) VALUES (?, ?)');
+                for (const tag of tags) {
+                    insertTag.run(tag, cacheKey);
+                }
+            }
+        })();
+    }
+    delete(cacheKey) {
+        this.#db.transaction(() => {
+            this.#db.query('DELETE FROM prerender_entries WHERE cache_key = ?').run(cacheKey);
+            this.#db.query('DELETE FROM revalidate_targets WHERE cache_key = ?').run(cacheKey);
+            this.#db.query('DELETE FROM revalidate_target_tags WHERE cache_key = ?').run(cacheKey);
+        })();
+    }
+    acquireRevalidateLock(cacheKey, ttlSeconds) {
+        const now = Date.now();
+        // Clean expired lock, then try to insert
+        return this.#db.transaction(() => {
+            this.#db
+                .query('DELETE FROM revalidate_locks WHERE cache_key = ? AND expires_at <= ?')
+                .run(cacheKey, now);
+            const existing = this.#db
+                .query('SELECT expires_at FROM revalidate_locks WHERE cache_key = ?')
+                .get(cacheKey);
+            if (existing) {
+                return false;
+            }
+            this.#db
+                .query('INSERT INTO revalidate_locks (cache_key, expires_at) VALUES (?, ?)')
+                .run(cacheKey, now + ttlSeconds * 1000);
+            return true;
+        })();
+    }
+    getTagManifestEntries(tags) {
+        const entries = {};
+        const uniqueTags = unique(tags);
+        if (uniqueTags.length === 0)
+            return entries;
+        const placeholders = uniqueTags.map(() => '?').join(',');
+        const rows = this.#db
+            .query(`SELECT tag, stale_at, expired_at FROM tag_manifest WHERE tag IN (${placeholders})`)
+            .all(...uniqueTags);
+        for (const row of rows) {
+            const entry = {};
+            if (row.stale_at !== null)
+                entry.staleAt = row.stale_at;
+            if (row.expired_at !== null)
+                entry.expiredAt = row.expired_at;
+            entries[row.tag] = entry;
+        }
+        return entries;
+    }
+    updateTagManifest(tags, update) {
+        const now = update.now ?? Date.now();
+        const uniqueTags = unique(tags);
+        this.#db.transaction(() => {
+            for (const tag of uniqueTags) {
+                if (!tag)
+                    continue;
+                if (update.mode === 'stale') {
+                    const expiredAt = typeof update.expireSeconds === 'number' && Number.isFinite(update.expireSeconds)
+                        ? now + update.expireSeconds * 1000
+                        : null;
+                    this.#db
+                        .query(`INSERT INTO tag_manifest (tag, stale_at, expired_at) VALUES (?, ?, ?)
+               ON CONFLICT(tag) DO UPDATE SET stale_at = excluded.stale_at,
+               expired_at = COALESCE(excluded.expired_at, tag_manifest.expired_at)`)
+                        .run(tag, now, expiredAt);
+                }
+                else {
+                    this.#db
+                        .query(`INSERT INTO tag_manifest (tag, expired_at) VALUES (?, ?)
+               ON CONFLICT(tag) DO UPDATE SET expired_at = excluded.expired_at`)
+                        .run(tag, now);
+                }
+            }
+        })();
+    }
+    findRevalidateTargets(query) {
+        const cacheKeys = new Set();
+        if (query.pathnames && query.pathnames.length > 0) {
+            const uniquePathnames = unique(query.pathnames);
+            const placeholders = uniquePathnames.map(() => '?').join(',');
+            const rows = this.#db
+                .query(`SELECT cache_key FROM revalidate_targets WHERE pathname IN (${placeholders})`)
+                .all(...uniquePathnames);
+            for (const row of rows) {
+                cacheKeys.add(row.cache_key);
+            }
+        }
+        if (query.tags && query.tags.length > 0) {
+            const uniqueTags = unique(query.tags);
+            const placeholders = uniqueTags.map(() => '?').join(',');
+            const rows = this.#db
+                .query(`SELECT DISTINCT cache_key FROM revalidate_target_tags WHERE tag IN (${placeholders})`)
+                .all(...uniqueTags);
+            for (const row of rows) {
+                cacheKeys.add(row.cache_key);
+            }
+        }
+        if (cacheKeys.size === 0)
+            return [];
+        const keysArray = [...cacheKeys];
+        const placeholders = keysArray.map(() => '?').join(',');
+        const rows = this.#db
+            .query(`SELECT cache_key, pathname, group_id FROM revalidate_targets WHERE cache_key IN (${placeholders})`)
+            .all(...keysArray);
+        return rows
+            .map((row) => ({
+            cacheKey: row.cache_key,
+            pathname: row.pathname,
+            groupId: row.group_id,
+        }))
+            .sort((left, right) => {
+            const byPathname = left.pathname.localeCompare(right.pathname);
+            if (byPathname !== 0)
+                return byPathname;
+            return left.cacheKey.localeCompare(right.cacheKey);
+        });
+    }
+}
+export class SqliteImageCacheStore {
+    #db;
+    constructor(db) {
+        this.#db = db;
+    }
+    get(cacheKey) {
+        const row = this.#db
+            .query('SELECT * FROM image_entries WHERE cache_key = ?')
+            .get(cacheKey);
+        if (!row)
+            return null;
+        return {
+            cacheKey: row.cache_key,
+            pathname: row.pathname,
+            status: row.status,
+            headers: JSON.parse(row.headers),
+            body: row.body,
+            bodyEncoding: row.body_encoding,
+            createdAt: row.created_at,
+            revalidateAt: row.revalidate_at,
+            expiresAt: row.expires_at,
+        };
+    }
+    set(cacheKey, entry) {
+        this.#db
+            .query(`INSERT OR REPLACE INTO image_entries
+         (cache_key, pathname, status, headers, body, body_encoding,
+          created_at, revalidate_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(cacheKey, entry.pathname, entry.status, JSON.stringify(entry.headers), entry.body, entry.bodyEncoding, entry.createdAt, entry.revalidateAt, entry.expiresAt);
+    }
+    delete(cacheKey) {
+        this.#db.query('DELETE FROM image_entries WHERE cache_key = ?').run(cacheKey);
+    }
+}
+export function createSqliteCacheStores(options = {}) {
+    const dbPath = options.dbPath ?? path.join(options.adapterDir ?? '.', 'cache.db');
+    const db = new Database(dbPath);
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec(SCHEMA_SQL);
+    return {
+        prerenderCacheStore: new SqlitePrerenderCacheStore(db),
+        imageCacheStore: new SqliteImageCacheStore(db),
+    };
+}
