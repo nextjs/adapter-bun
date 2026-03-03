@@ -523,9 +523,14 @@ function shouldAttemptAppNotFoundFunction({
     return false;
   }
 
-  // Allow the app not-found handler for asset-like paths too — Next.js
-  // renders the not-found page for non-existent assets (e.g. /favicon.ico
-  // when no favicon exists) so the response is HTML with a proper 404 status.
+  // Skip the app not-found handler for asset-like paths under _next/ to
+  // avoid returning HTML for JS/CSS chunk requests. For other asset-like
+  // paths (e.g. /favicon.ico), allow the app not-found handler since
+  // Next.js renders a proper HTML 404 page for non-existent assets.
+  if (requestInfo.isAssetPath && requestInfo.pathnameWithoutBasePath.startsWith('/_next/')) {
+    return false;
+  }
+
   return true;
 }
 
