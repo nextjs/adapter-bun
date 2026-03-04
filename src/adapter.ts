@@ -249,6 +249,160 @@ const app = createNext({
 await app.prepare();
 const handle = app.getRequestHandler();
 
+function normalizeWorkerPath(workerPath) {
+  const withoutAppPrefix = workerPath.startsWith('app/')
+    ? workerPath.slice('app/'.length)
+    : workerPath;
+  const withoutLeaf = withoutAppPrefix.replace(/\\/(page|route)$/, '');
+  if (withoutLeaf.length === 0) {
+    return '/';
+  }
+  return withoutLeaf.startsWith('/') ? withoutLeaf : '/' + withoutLeaf;
+}
+
+async function loadNodeActionWorkerPaths() {
+  const nodeActionWorkers = new Map();
+  const configuredDistDir =
+    typeof manifest.build?.distDir === 'string' && manifest.build.distDir.length > 0
+      ? manifest.build.distDir
+      : '.next';
+  const resolvedDistDir = path.isAbsolute(configuredDistDir)
+    ? configuredDistDir
+    : path.join(projectDir, configuredDistDir);
+  const serverReferenceManifestPath = path.join(
+    resolvedDistDir,
+    'server',
+    'server-reference-manifest.json'
+  );
+
+  try {
+    const parsedManifest = await Bun.file(serverReferenceManifestPath).json();
+    const nodeEntries =
+      parsedManifest &&
+      typeof parsedManifest === 'object' &&
+      parsedManifest.node &&
+      typeof parsedManifest.node === 'object'
+        ? parsedManifest.node
+        : {};
+
+    for (const [actionId, record] of Object.entries(nodeEntries)) {
+      if (!record || typeof record !== 'object') {
+        continue;
+      }
+
+      const workers =
+        record.workers && typeof record.workers === 'object' ? record.workers : null;
+      if (!workers) {
+        continue;
+      }
+
+      const firstWorkerPath = Object.keys(workers)[0];
+      if (!firstWorkerPath) {
+        continue;
+      }
+
+      nodeActionWorkers.set(actionId, normalizeWorkerPath(firstWorkerPath));
+    }
+  } catch (error) {
+    console.warn(
+      '[adapter-bun] failed to load server reference manifest for action fallback:',
+      error
+    );
+  }
+
+  return nodeActionWorkers;
+}
+
+const nodeActionWorkerPaths = await loadNodeActionWorkerPaths();
+
+function getSingleHeaderValue(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+async function maybeForwardActionRequestToNode(req, res) {
+  if (req.method !== 'POST') {
+    return false;
+  }
+
+  const actionId = getSingleHeaderValue(req.headers['next-action']);
+  if (typeof actionId !== 'string' || actionId.length === 0) {
+    return false;
+  }
+
+  const nodeWorkerPath = nodeActionWorkerPaths.get(actionId);
+  if (!nodeWorkerPath) {
+    return false;
+  }
+
+  const rawUrl = typeof req.url === 'string' ? req.url : '/';
+  const parsedUrl = new URL(rawUrl, 'http://n');
+  if (parsedUrl.pathname === nodeWorkerPath) {
+    return false;
+  }
+
+  const internalOrigin =
+    process.env.__NEXT_PRIVATE_ORIGIN || protocol + '://' + appHostname + ':' + port;
+  const targetUrl = new URL(nodeWorkerPath + parsedUrl.search, internalOrigin);
+  const forwardedHeaders = {};
+
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value === undefined) {
+      continue;
+    }
+    forwardedHeaders[name] = Array.isArray(value) ? value.join(', ') : String(value);
+  }
+
+  forwardedHeaders['x-action-forwarded'] = '1';
+  if (!forwardedHeaders['x-forwarded-host']) {
+    forwardedHeaders['x-forwarded-host'] =
+      forwardedHeaders.host || appHostname + ':' + String(port);
+  }
+  if (!forwardedHeaders.origin) {
+    forwardedHeaders.origin = internalOrigin;
+  }
+
+  const forwardedResponse = await fetch(targetUrl, {
+    method: 'POST',
+    headers: forwardedHeaders,
+    body: req,
+    duplex: 'half',
+    redirect: 'manual',
+  });
+
+  res.statusCode = forwardedResponse.status;
+  for (const [name, value] of forwardedResponse.headers) {
+    const lowerName = name.toLowerCase();
+    if (
+      lowerName === 'transfer-encoding' ||
+      lowerName === 'connection' ||
+      lowerName === 'content-encoding' ||
+      lowerName === 'content-length'
+    ) {
+      continue;
+    }
+    res.setHeader(name, value);
+  }
+
+  if (!forwardedResponse.body) {
+    res.end();
+    return true;
+  }
+
+  const reader = forwardedResponse.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (value && value.length > 0) {
+      res.write(value);
+    }
+  }
+
+  res.end();
+  return true;
+}
+
 function normalizeCacheControlHeader(value) {
   const raw = Array.isArray(value) ? value.join(', ') : String(value ?? '');
   const normalized = raw.trim();
@@ -322,10 +476,7 @@ const server = http.createServer(async (req, res) => {
 
   const userAgent =
     typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
-  if (
-    (req.method === 'GET' || req.method === 'HEAD') &&
-    userAgent.includes('node-fetch')
-  ) {
+  if (userAgent.includes('node-fetch')) {
     req.headers.connection = 'close';
     res.setHeader('connection', 'close');
   }
@@ -343,6 +494,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (await maybeForwardActionRequestToNode(req, res)) {
+      return;
+    }
     await handle(req, res);
   } catch (err) {
     console.error('[adapter-bun] error handling request:', err);
