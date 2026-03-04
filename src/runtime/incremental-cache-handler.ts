@@ -13,25 +13,8 @@ import type {
   SetIncrementalResponseCacheContext,
 } from 'next/dist/server/response-cache';
 
-const STORE_KEY_PREFIX = 'incremental:';
 const MAP_MARKER = '__adapter_bun_type';
-const KNOWN_INCREMENTAL_KINDS = [
-  'FETCH',
-  'APP_PAGE',
-  'APP_ROUTE',
-  'PAGES',
-  'IMAGE',
-  'REDIRECT',
-  'UNKNOWN',
-] as const;
-
-function normalizeKind(kind: unknown): string {
-  return typeof kind === 'string' && kind.length > 0 ? kind : 'UNKNOWN';
-}
-
-function toStoreKey(cacheKey: string, kind: unknown): string {
-  return `${STORE_KEY_PREFIX}${normalizeKind(kind)}:${cacheKey}`;
-}
+const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 
 function normalizeTags(tags: string[]): string[] {
   const unique = new Set<string>();
@@ -187,6 +170,71 @@ function decodeCacheValue(payload: string): IncrementalCacheValue {
   }) as IncrementalCacheValue;
 }
 
+function decodeSeededPrerenderValue(
+  cacheKey: string,
+  row: {
+    body: string;
+    headers: Record<string, string>;
+    status: number;
+  },
+  ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext,
+  store: ReturnType<typeof getSharedPrerenderCacheStore>
+): IncrementalCacheValue | null {
+  if (ctx.kind === 'APP_ROUTE') {
+    return {
+      kind: 'APP_ROUTE',
+      body: Buffer.from(row.body, 'base64'),
+      headers: row.headers,
+      status: row.status,
+    } as IncrementalCacheValue;
+  }
+
+  if (ctx.kind === 'APP_PAGE') {
+    const html = Buffer.from(row.body, 'base64').toString('utf8');
+    const rscRow = store.get(`${cacheKey}.rsc`);
+    const rscData = rscRow ? Buffer.from(rscRow.body, 'base64') : undefined;
+    const segmentRows = store.findByPrefix(`${cacheKey}.segments/`);
+    const segmentData = new Map<string, Buffer>();
+
+    for (const segmentRow of segmentRows) {
+      if (!segmentRow.cacheKey.endsWith(SEGMENT_RSC_SUFFIX)) {
+        continue;
+      }
+      const segmentPath = segmentRow.cacheKey.slice(
+        `${cacheKey}.segments`.length,
+        -SEGMENT_RSC_SUFFIX.length
+      );
+      if (segmentPath.length === 0) {
+        continue;
+      }
+      segmentData.set(segmentPath, Buffer.from(segmentRow.body, 'base64'));
+    }
+
+    return {
+      kind: 'APP_PAGE',
+      html,
+      rscData,
+      headers: row.headers,
+      postponed: undefined,
+      status: row.status,
+      segmentData: segmentData.size > 0 ? segmentData : undefined,
+    } as IncrementalCacheValue;
+  }
+
+  if (ctx.kind === 'PAGES') {
+    const html = Buffer.from(row.body, 'base64').toString('utf8');
+    return {
+      kind: 'PAGES',
+      html,
+      pageData: {},
+      headers: row.headers,
+      status: row.status,
+    } as IncrementalCacheValue;
+  }
+
+  return null;
+}
+
 async function updateTagManifests(
   tags: string[],
   update: PrerenderTagManifestUpdate & { now: number }
@@ -233,7 +281,7 @@ export default class BunSqliteIncrementalCacheHandler
     ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext
   ): Promise<CacheHandlerValue | null> {
     const store = getSharedPrerenderCacheStore();
-    const row = store.get(toStoreKey(cacheKey, ctx.kind));
+    const row = store.get(cacheKey);
     if (!row) return null;
 
     const queryTags = getFetchContextTags(ctx);
@@ -256,11 +304,20 @@ export default class BunSqliteIncrementalCacheHandler
       }
     }
 
-    let value: IncrementalCacheValue | null;
+    const payload = Buffer.from(row.body, 'base64').toString('utf8');
+    let value: IncrementalCacheValue | null = null;
+    let decoded = false;
     try {
-      value = decodeCacheValue(Buffer.from(row.body, 'base64').toString('utf8'));
-    } catch {
-      return null;
+      value = decodeCacheValue(payload);
+      decoded = true;
+    } catch {}
+
+    if (!decoded) {
+      const seeded = decodeSeededPrerenderValue(cacheKey, row, ctx, store);
+      if (!seeded) {
+        return null;
+      }
+      value = seeded;
     }
 
     return {
@@ -275,16 +332,9 @@ export default class BunSqliteIncrementalCacheHandler
     ctx: SetIncrementalFetchCacheContext | SetIncrementalResponseCacheContext
   ): Promise<void> {
     const store = getSharedPrerenderCacheStore();
-    const storeKey = toStoreKey(cacheKey, data?.kind);
 
     if (data === null || data === undefined) {
-      if (ctx?.fetchCache) {
-        store.delete?.(toStoreKey(cacheKey, 'FETCH'));
-      } else {
-        for (const kind of KNOWN_INCREMENTAL_KINDS) {
-          store.delete?.(toStoreKey(cacheKey, kind));
-        }
-      }
+      store.delete?.(cacheKey);
       return;
     }
 
@@ -303,8 +353,8 @@ export default class BunSqliteIncrementalCacheHandler
         ? ctx.cacheControl.expire
         : null;
 
-    store.set(storeKey, {
-      cacheKey: storeKey,
+    store.set(cacheKey, {
+      cacheKey,
       pathname: cacheKey,
       groupId: 0,
       status: 200,

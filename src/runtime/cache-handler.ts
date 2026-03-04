@@ -9,11 +9,18 @@ function getStore() {
   return getSharedPrerenderCacheStore();
 }
 
+const pendingSets = new Map<string, Promise<void>>();
+
 class CacheHandler implements NextUseCacheHandler {
   async get(
     cacheKey: string,
     softTags: string[]
   ): Promise<undefined | CacheEntry> {
+    const pendingPromise = pendingSets.get(cacheKey);
+    if (pendingPromise) {
+      await pendingPromise;
+    }
+
     const store = getStore();
     const row = store.get(cacheKey);
     if (!row) return undefined;
@@ -82,50 +89,63 @@ class CacheHandler implements NextUseCacheHandler {
     cacheKey: string,
     pendingEntry: Promise<CacheEntry>
   ): Promise<void> {
-    const entry = await pendingEntry;
-
-    // Collect all chunks from the ReadableStream
-    const reader = entry.value.getReader();
-    const chunks: Uint8Array[] = [];
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) chunks.push(value);
-      }
-    } catch {
-      // Partial data — discard
-      return;
-    }
-
-    const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-    const combined = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      combined.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-
-    const body = Buffer.from(combined).toString('base64');
-    const now = Date.now();
-    const store = getStore();
-
-    store.set(cacheKey, {
-      cacheKey,
-      pathname: cacheKey,
-      groupId: 0,
-      status: 200,
-      headers: {
-        'x-next-cache-tags': entry.tags.join(','),
-      },
-      body,
-      bodyEncoding: 'base64',
-      createdAt: entry.timestamp || now,
-      revalidateAt:
-        entry.revalidate > 0 ? (entry.timestamp || now) + entry.revalidate * 1000 : null,
-      expiresAt:
-        entry.expire > 0 ? (entry.timestamp || now) + entry.expire * 1000 : null,
+    let resolvePending: () => void = () => {};
+    const pendingPromise = new Promise<void>((resolve) => {
+      resolvePending = resolve;
     });
+    pendingSets.set(cacheKey, pendingPromise);
+
+    try {
+      const entry = await pendingEntry;
+
+      // Collect all chunks from the ReadableStream
+      const reader = entry.value.getReader();
+      const chunks: Uint8Array[] = [];
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) chunks.push(value);
+        }
+      } catch {
+        // Partial data — discard
+        return;
+      }
+
+      const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+      const combined = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+
+      const body = Buffer.from(combined).toString('base64');
+      const now = Date.now();
+      const store = getStore();
+
+      const createdAt = entry.timestamp ?? now;
+
+      store.set(cacheKey, {
+        cacheKey,
+        pathname: cacheKey,
+        groupId: 0,
+        status: 200,
+        headers: {
+          'x-next-cache-tags': entry.tags.join(','),
+        },
+        body,
+        bodyEncoding: 'base64',
+        createdAt,
+        revalidateAt:
+          entry.revalidate > 0 ? createdAt + entry.revalidate * 1000 : null,
+        expiresAt:
+          entry.expire > 0 ? createdAt + entry.expire * 1000 : null,
+      });
+    } finally {
+      resolvePending();
+      pendingSets.delete(cacheKey);
+    }
   }
 
   async refreshTags(): Promise<void> {

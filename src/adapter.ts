@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -24,6 +23,7 @@ export const ADAPTER_NAME = 'bun';
 export const DEFAULT_BUN_ADAPTER_OUT_DIR = 'bun-dist';
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = '0.0.0.0';
+const RUNTIME_NEXT_CONFIG_FILE = 'runtime-next-config.json';
 const CACHE_RUNTIME_MODULES = [
   'cache-handler.js',
   'incremental-cache-handler.js',
@@ -97,6 +97,56 @@ async function readPreviewProps(
   }
 }
 
+function toJsonRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
+function createRuntimeNextConfig(
+  config: BuildCompleteContext['config']
+): Record<string, unknown> {
+  let cloned: unknown;
+  try {
+    cloned = JSON.parse(JSON.stringify(config));
+  } catch {
+    cloned = {};
+  }
+
+  const configRecord = toJsonRecord(cloned);
+  delete configRecord.outputFileTracingRoot;
+  delete configRecord.cacheHandler;
+
+  const cacheHandlersValue = configRecord.cacheHandlers;
+  if (cacheHandlersValue && typeof cacheHandlersValue === 'object') {
+    const cacheHandlers = {
+      ...(cacheHandlersValue as Record<string, unknown>),
+    };
+    delete cacheHandlers.remote;
+    configRecord.cacheHandlers = cacheHandlers;
+  }
+
+  const experimentalValue = configRecord.experimental;
+  if (experimentalValue && typeof experimentalValue === 'object') {
+    const experimental = {
+      ...(experimentalValue as Record<string, unknown>),
+    };
+    delete experimental.adapterPath;
+    configRecord.experimental = experimental;
+  }
+
+  return configRecord;
+}
+
+async function writeRuntimeNextConfig(
+  outDir: string,
+  config: BuildCompleteContext['config']
+): Promise<void> {
+  const runtimeNextConfig = createRuntimeNextConfig(config);
+  await writeJsonFile(path.join(outDir, RUNTIME_NEXT_CONFIG_FILE), runtimeNextConfig);
+}
+
 const SERVER_ENTRY_TEMPLATE = `import path from 'node:path';
 import http from 'node:http';
 
@@ -106,15 +156,6 @@ const manifest = await Bun.file(manifestPath).json();
 
 // Tell the cache handler where to find cache.db
 process.env.BUN_ADAPTER_CACHE_DB_PATH = path.join(adapterDir, 'cache.db');
-
-// Set preview mode env before importing next
-const previewProps = manifest.runtime?.previewProps;
-if (previewProps) {
-  process.env.__NEXT_PREVIEW_MODE_ID ??= previewProps.previewModeId;
-  process.env.__NEXT_PREVIEW_MODE_SIGNING_KEY ??= previewProps.previewModeSigningKey;
-  process.env.__NEXT_PREVIEW_MODE_ENCRYPTION_KEY ??=
-    previewProps.previewModeEncryptionKey;
-}
 
 // Resolve project directory (parent of bun-dist/)
 const projectDir = process.env.NEXT_PROJECT_DIR || path.resolve(adapterDir, '..');
@@ -134,44 +175,77 @@ const appHostname =
       ? listenHostname
       : 'localhost';
 
+async function loadRuntimeNextConfig() {
+  const runtimeNextConfigPath = path.join(
+    adapterDir,
+    '${RUNTIME_NEXT_CONFIG_FILE}'
+  );
+
+  let serializedConfig = {};
+  try {
+    const loadedConfig = await Bun.file(runtimeNextConfigPath).json();
+    if (loadedConfig && typeof loadedConfig === 'object') {
+      serializedConfig = loadedConfig;
+    }
+  } catch (error) {
+    console.warn(
+      '[adapter-bun] failed to load adapter runtime next config:',
+      error
+    );
+  }
+
+  const configRecord =
+    serializedConfig && typeof serializedConfig === 'object' ? serializedConfig : {};
+  const distDir =
+    typeof configRecord.distDir === 'string' && configRecord.distDir.length > 0
+      ? configRecord.distDir
+      : typeof manifest.build?.distDir === 'string' && manifest.build.distDir.length > 0
+        ? manifest.build.distDir
+        : '.next';
+  const runtimeCacheHandlerPath = path.join(
+    adapterDir,
+    'runtime',
+    'incremental-cache-handler.js'
+  );
+  const runtimeRemoteCacheHandlerPath = path.join(
+    adapterDir,
+    'runtime',
+    'cache-handler.js'
+  );
+  const existingCacheHandlers =
+    configRecord.cacheHandlers && typeof configRecord.cacheHandlers === 'object'
+      ? configRecord.cacheHandlers
+      : {};
+
+  return {
+    ...configRecord,
+    distDir,
+    cacheHandler: runtimeCacheHandlerPath,
+    cacheHandlers: {
+      ...existingCacheHandlers,
+      remote: runtimeRemoteCacheHandlerPath,
+    },
+  };
+}
+
+const runtimeNextConfig = await loadRuntimeNextConfig();
 const createNext = (await import('next')).default;
 const app = createNext({
   dir: projectDir,
   dev: false,
-  customServer: true,
   quiet: false,
   hostname: appHostname,
   port,
+  conf: runtimeNextConfig
 });
 await app.prepare();
 const handle = app.getRequestHandler();
-
-function normalizeVary(value) {
-  const parts = (Array.isArray(value) ? value.join(',') : String(value))
-    .split(',')
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0 && part.toLowerCase() !== 'accept-encoding');
-  return parts.join(', ');
-}
 
 const server = http.createServer(async (req, res) => {
   try {
     // Bun's Node HTTP compatibility can intermittently reset reused keep-alive
     // sockets in long e2e runs. Force short-lived connections for stability.
     req.headers.connection = 'close';
-    delete req.headers['accept-encoding'];
-
-    const originalSetHeader = res.setHeader.bind(res);
-    res.setHeader = (name, value) => {
-      const key = String(name).toLowerCase();
-      if (key === 'vary') {
-        return originalSetHeader(name, normalizeVary(value));
-      }
-      if (key === 'connection') {
-        return originalSetHeader(name, 'close');
-      }
-      return originalSetHeader(name, value);
-    };
     res.setHeader('connection', 'close');
 
     await handle(req, res);
@@ -300,8 +374,8 @@ async function seedPrerenderCache({
   const db = new Database(dbPath);
 
   try {
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec(SCHEMA_SQL);
+    db.run('PRAGMA journal_mode = WAL');
+    db.run(SCHEMA_SQL);
 
     const insertEntry = db.query(
       `INSERT OR REPLACE INTO prerender_entries
@@ -338,14 +412,7 @@ async function seedPrerenderCache({
       const bodyBuffer = await Bun.file(sourcePath).arrayBuffer();
       const body = Buffer.from(bodyBuffer).toString('base64');
 
-      const payload = JSON.stringify({
-        seedPathname: prerender.pathname,
-        requestPathname: prerender.pathname,
-        query: {},
-        headers: {},
-      });
-      const hash = createHash('sha256').update(payload).digest('hex');
-      const cacheKey = `prerender:${prerender.pathname}:${hash}`;
+      const cacheKey = prerender.pathname;
 
       const tags = collectTags(prerender.config, fallback.initialHeaders);
       const headers = flattenHeaders(fallback.initialHeaders ?? null);
@@ -456,6 +523,7 @@ async function onBuildComplete(
     prerenders: ctx.outputs.prerenders,
     repoRoot: ctx.repoRoot,
   });
+  await writeRuntimeNextConfig(outDir, ctx.config);
   await writeServerEntry(outDir);
 }
 
@@ -493,17 +561,6 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
       const existingCacheHandlers = configRecord.cacheHandlers as
         | Record<string, string | undefined>
         | undefined;
-      const hasDefaultCacheHandlersEntry =
-        typeof existingCacheHandlers?.default === 'string' &&
-        existingCacheHandlers.default.length > 0;
-      const hasRemoteCacheHandlersEntry =
-        typeof existingCacheHandlers?.remote === 'string' &&
-        existingCacheHandlers.remote.length > 0;
-      const existingCacheHandler =
-        typeof configRecord.cacheHandler === 'string' &&
-        configRecord.cacheHandler.length > 0
-          ? configRecord.cacheHandler
-          : undefined;
 
       // Stage the cache handler runtime into the output dir so the path is
       // inside the project tree (Turbopack rejects absolute paths that leave
@@ -515,9 +572,7 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
       const sourceDir = path.join(import.meta.dirname, 'runtime');
       for (const mod of CACHE_RUNTIME_MODULES) {
         const dest = path.join(runtimeDir, mod);
-        if (!existsSync(dest)) {
-          copyFileSync(path.join(sourceDir, mod), dest);
-        }
+        copyFileSync(path.join(sourceDir, mod), dest);
       }
       const useCacheHandlerPath = path.resolve(
         configuredOutDir,
@@ -532,15 +587,8 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
 
       const cacheHandlersConfig: Record<string, string | undefined> = {
         ...(existingCacheHandlers ?? {}),
+        remote: useCacheHandlerPath,
       };
-      if (!hasDefaultCacheHandlersEntry) {
-        cacheHandlersConfig.default = useCacheHandlerPath;
-      }
-      if (!hasRemoteCacheHandlersEntry) {
-        cacheHandlersConfig.remote = useCacheHandlerPath;
-      }
-
-      const cacheHandlerPath = existingCacheHandler ?? incrementalCacheHandlerPath;
 
       return {
         ...config,
@@ -552,7 +600,7 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
               },
             }
           : {}),
-        cacheHandler: cacheHandlerPath,
+        cacheHandler: incrementalCacheHandlerPath,
         cacheHandlers: cacheHandlersConfig,
         // Enable cacheComponents when the experimental flag is set via env.
         ...(process.env.__NEXT_CACHE_COMPONENTS === 'true' ||

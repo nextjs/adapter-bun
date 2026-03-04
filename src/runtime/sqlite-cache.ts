@@ -75,11 +75,49 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
 export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
   #db: Database;
 
   constructor(db: Database) {
     this.#db = db;
+  }
+
+  #toPrerenderEntry(row: {
+    cache_key: string;
+    pathname: string;
+    group_id: number;
+    status: number;
+    headers: string;
+    body: string;
+    body_encoding: string;
+    created_at: number;
+    revalidate_at: number | null;
+    expires_at: number | null;
+    cache_query: string | null;
+    cache_headers: string | null;
+  }): PrerenderCacheEntry {
+    return {
+      cacheKey: row.cache_key,
+      pathname: row.pathname,
+      groupId: row.group_id,
+      status: row.status,
+      headers: JSON.parse(row.headers) as Record<string, string>,
+      body: row.body,
+      bodyEncoding: row.body_encoding as 'base64',
+      createdAt: row.created_at,
+      revalidateAt: row.revalidate_at,
+      expiresAt: row.expires_at,
+      cacheQuery: row.cache_query
+        ? (JSON.parse(row.cache_query) as Record<string, string[]>)
+        : undefined,
+      cacheHeaders: row.cache_headers
+        ? (JSON.parse(row.cache_headers) as Record<string, string>)
+        : undefined,
+    };
   }
 
   get(cacheKey: string): PrerenderCacheEntry | null {
@@ -105,24 +143,35 @@ export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
 
     if (!row) return null;
 
-    return {
-      cacheKey: row.cache_key,
-      pathname: row.pathname,
-      groupId: row.group_id,
-      status: row.status,
-      headers: JSON.parse(row.headers) as Record<string, string>,
-      body: row.body,
-      bodyEncoding: row.body_encoding as 'base64',
-      createdAt: row.created_at,
-      revalidateAt: row.revalidate_at,
-      expiresAt: row.expires_at,
-      cacheQuery: row.cache_query
-        ? (JSON.parse(row.cache_query) as Record<string, string[]>)
-        : undefined,
-      cacheHeaders: row.cache_headers
-        ? (JSON.parse(row.cache_headers) as Record<string, string>)
-        : undefined,
-    };
+    return this.#toPrerenderEntry(row);
+  }
+
+  findByPrefix(cacheKeyPrefix: string): PrerenderCacheEntry[] {
+    const escapedPrefix = escapeLikePattern(cacheKeyPrefix);
+    const pattern = `${escapedPrefix}%`;
+    const rows = this.#db
+      .query<
+        {
+          cache_key: string;
+          pathname: string;
+          group_id: number;
+          status: number;
+          headers: string;
+          body: string;
+          body_encoding: string;
+          created_at: number;
+          revalidate_at: number | null;
+          expires_at: number | null;
+          cache_query: string | null;
+          cache_headers: string | null;
+        },
+        [string]
+      >(
+        "SELECT * FROM prerender_entries WHERE cache_key LIKE ? ESCAPE '\\' ORDER BY cache_key ASC"
+      )
+      .all(pattern);
+
+    return rows.map((row) => this.#toPrerenderEntry(row));
   }
 
   set(cacheKey: string, entry: PrerenderCacheEntry): void {
@@ -400,8 +449,8 @@ export function createSqliteCacheStores(options: SqliteCacheOptions & { adapterD
   const dbPath = options.dbPath ?? path.join(options.adapterDir ?? '.', 'cache.db');
   const db = new Database(dbPath);
 
-  db.exec('PRAGMA journal_mode = WAL');
-  db.exec(SCHEMA_SQL);
+  db.run('PRAGMA journal_mode = WAL');
+  db.run(SCHEMA_SQL);
 
   return {
     prerenderCacheStore: new SqlitePrerenderCacheStore(db),
