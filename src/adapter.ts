@@ -607,10 +607,6 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
         process.env.NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS === 'true'
           ? { cacheComponents: true }
           : {}),
-        experimental: {
-          ...config.experimental,
-          trustHostHeader: true,
-        },
       } as typeof config;
     },
     async onBuildComplete(ctx) {
