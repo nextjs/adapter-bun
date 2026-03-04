@@ -42,20 +42,25 @@ if [ -z "${NEXT_PRIVATE_TEST_MODE:-}" ] && [ -n "${NEXT_TEST_MODE:-}" ]; then
 fi
 
 # 5. Build (NEXT_ADAPTER_PATH tells Next.js to use our adapter).
-# Run fixture setup/post-build hooks when present, but always execute the core
-# Next build through Bun so adapter hooks can use Bun-only APIs.
+# The Next.js test harness always wires a `build` script in package.json.
+# Execute that script, but force `next build` segments to run through Bun.
 : > "$NEXT_TEST_DIR/.adapter-build.log"
 
-has_script() {
-  local script_name="$1"
+BUILD_SCRIPT="$(
   node -e "
-const pkg=JSON.parse(require('fs').readFileSync('package.json','utf8'));
-process.exit(pkg.scripts && pkg.scripts['$script_name'] ? 0 : 1);
-" >/dev/null 2>&1
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+const build = pkg?.scripts?.build;
+if (typeof build === 'string' && build.trim().length > 0) {
+  const normalized = build.replace(/\\bnext\\s+build\\b/g, 'bun --bun next build');
+  console.log(normalized);
 }
+" 2>/dev/null || true
+)"
 
-if has_script "setup"; then
-  bun run setup >&2
+if [ -z "$BUILD_SCRIPT" ]; then
+  echo 'Missing package.json scripts.build in deploy test dir' >&2
+  exit 1
 fi
 
 # Generate a stable deployment ID before the build so it is baked into
@@ -73,11 +78,7 @@ if [ -n "${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS:-}" ]; then
   export __NEXT_CACHE_COMPONENTS="${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS}"
 fi
 
-bun --bun next build 2>&1 | tee -a "$NEXT_TEST_DIR/.adapter-build.log" >&2
-
-if has_script "post-build"; then
-  bun run post-build >&2
-fi
+bash -lc "$BUILD_SCRIPT" 2>&1 | tee -a "$NEXT_TEST_DIR/.adapter-build.log" >&2
 
 # 6. Record build ID markers for logs script
 BUILD_ID=$(cat ".next/BUILD_ID" 2>/dev/null || echo "unknown")

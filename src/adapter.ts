@@ -154,6 +154,53 @@ const adapterDir = import.meta.dirname;
 const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
 const manifest = await Bun.file(manifestPath).json();
 
+// NEXT_ADAPTER_PATH is required at build-time to activate adapter hooks, but
+// keeping it at runtime changes Next.js request handling branches in ways that
+// conflict with this standalone server entry.
+delete process.env.NEXT_ADAPTER_PATH;
+
+function inferContentType(pathname) {
+  if (pathname.endsWith('.xml')) return 'application/xml';
+  if (pathname.endsWith('.webmanifest')) return 'application/manifest+json';
+  if (pathname.endsWith('.json')) return 'application/json';
+  if (pathname.endsWith('.txt')) return 'text/plain';
+  if (pathname.endsWith('.ico')) return 'image/x-icon';
+  if (pathname.endsWith('.png')) return 'image/png';
+  if (pathname.endsWith('.svg')) return 'image/svg+xml';
+  if (pathname.endsWith('.js')) return 'application/javascript';
+  if (pathname.endsWith('.css')) return 'text/css';
+  if (pathname.endsWith('.html')) return 'text/html; charset=utf-8';
+  return null;
+}
+
+const defaultStaticAssetCacheControl = 'public, max-age=0, must-revalidate';
+
+const staticAssetMap = new Map();
+if (Array.isArray(manifest.staticAssets)) {
+  for (const asset of manifest.staticAssets) {
+    if (!asset || typeof asset !== 'object') continue;
+    if (
+      typeof asset.pathname !== 'string' ||
+      asset.pathname.length === 0 ||
+      typeof asset.stagedPath !== 'string' ||
+      asset.stagedPath.length === 0
+    ) {
+      continue;
+    }
+    staticAssetMap.set(asset.pathname, {
+      filePath: path.join(adapterDir, asset.stagedPath),
+      contentType:
+        typeof asset.contentType === 'string' && asset.contentType.length > 0
+          ? asset.contentType
+          : inferContentType(asset.pathname),
+      cacheControl:
+        typeof asset.cacheControl === 'string' && asset.cacheControl.length > 0
+          ? asset.cacheControl
+          : defaultStaticAssetCacheControl,
+    });
+  }
+}
+
 // Tell the cache handler where to find cache.db
 process.env.BUN_ADAPTER_CACHE_DB_PATH = path.join(adapterDir, 'cache.db');
 
@@ -166,14 +213,17 @@ const port =
     ? requestedPort
     : manifest.server.port;
 const listenHostname = manifest.server.hostname;
-const configuredHostname =
-  process.env.NEXT_HOSTNAME || process.env.HOSTNAME || '';
+const configuredHostname = process.env.NEXT_HOSTNAME || '';
 const appHostname =
   configuredHostname && configuredHostname !== '0.0.0.0'
     ? configuredHostname
     : listenHostname !== '0.0.0.0'
       ? listenHostname
       : 'localhost';
+const protocol = process.env.__NEXT_EXPERIMENTAL_HTTPS === '1' ? 'https' : 'http';
+
+// Next's forwarded action/redirect fetches rely on this internal origin.
+process.env.__NEXT_PRIVATE_ORIGIN = protocol + '://' + appHostname + ':' + port;
 
 async function loadRuntimeNextConfig() {
   const runtimeNextConfigPath = path.join(
@@ -242,12 +292,67 @@ await app.prepare();
 const handle = app.getRequestHandler();
 
 const server = http.createServer(async (req, res) => {
-  try {
-    // Bun's Node HTTP compatibility can intermittently reset reused keep-alive
-    // sockets in long e2e runs. Force short-lived connections for stability.
-    req.headers.connection = 'close';
-    res.setHeader('connection', 'close');
+  // Normalize Bun's incoming headers into a plain mutable object so Next can
+  // safely patch/strip headers during RSC/action flows.
+  req.headers = { ...req.headers };
 
+  // Serve adapter-staged static assets directly. Some static metadata routes
+  // are emitted as .body files and are not always represented in prerender
+  // cache outputs.
+  const requestTarget = req.url || '/';
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    let pathname = null;
+    try {
+      pathname = new URL(requestTarget, protocol + '://' + appHostname).pathname;
+    } catch {}
+
+    if (pathname) {
+      const staticAsset = staticAssetMap.get(pathname);
+      if (staticAsset) {
+        try {
+          const file = Bun.file(staticAsset.filePath);
+          if (await file.exists()) {
+            if (staticAsset.contentType) {
+              res.setHeader('content-type', staticAsset.contentType);
+            }
+            if (staticAsset.cacheControl) {
+              res.setHeader('cache-control', staticAsset.cacheControl);
+            }
+            if (Number.isFinite(file.size) && file.size >= 0) {
+              res.setHeader('content-length', String(file.size));
+            }
+            res.statusCode = 200;
+            if (req.method === 'HEAD') {
+              res.end();
+              return;
+            }
+            const body = Buffer.from(await file.arrayBuffer());
+            res.end(body);
+            return;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // Some Bun fetch requests use Accept: */* for RSC refetches. Force the
+  // expected RSC accept header so Next serves Flight payloads instead of HTML.
+  if (req.headers['rsc'] === '1') {
+    if (!req.headers.accept || req.headers.accept === '*/*') {
+      req.headers.accept = 'text/x-component';
+    }
+    // Forwarded action redirects can inherit POST content-type on GET.
+    if (req.method === 'GET' && typeof req.headers['content-type'] === 'string') {
+      delete req.headers['content-type'];
+    }
+  }
+
+  // Bun's Node HTTP compatibility can intermittently reset reused keep-alive
+  // sockets in long E2E runs. Force short-lived connections for stability.
+  req.headers.connection = 'close';
+  res.setHeader('connection', 'close');
+
+  try {
     await handle(req, res);
   } catch (err) {
     console.error('[adapter-bun] error handling request:', err);
@@ -257,12 +362,6 @@ const server = http.createServer(async (req, res) => {
     res.end('Internal Server Error');
   }
 });
-
-// Bun's Node-compatible HTTP server can reset reused keep-alive sockets too
-// aggressively under long E2E runs. Keep connections open substantially
-// longer to reduce intermittent socket hang ups between test requests.
-server.keepAliveTimeout = 300000;
-server.headersTimeout = 301000;
 
 server.listen(port, listenHostname, () => {
   const addr = server.address();

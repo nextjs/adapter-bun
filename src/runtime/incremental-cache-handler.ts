@@ -15,6 +15,15 @@ import type {
 
 const MAP_MARKER = '__adapter_bun_type';
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
+const NULL_CACHE_ENTRY_MARKER = '__adapter_bun_null_cache_entry';
+const KNOWN_CACHE_KINDS = new Set([
+  'APP_PAGE',
+  'APP_ROUTE',
+  'PAGES',
+  'FETCH',
+  'REDIRECT',
+  'IMAGE',
+]);
 
 function normalizeTags(tags: string[]): string[] {
   const unique = new Set<string>();
@@ -144,7 +153,7 @@ function encodeCacheValue(value: IncrementalCacheValue): string {
   });
 }
 
-function decodeCacheValue(payload: string): IncrementalCacheValue {
+function decodeCacheValue(payload: string): unknown {
   return JSON.parse(payload, (_key, input) => {
     if (
       input &&
@@ -167,7 +176,19 @@ function decodeCacheValue(payload: string): IncrementalCacheValue {
       return new Map(input.entries);
     }
     return input;
-  }) as IncrementalCacheValue;
+  });
+}
+
+function isCacheValue(value: unknown): value is IncrementalCacheValue {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.kind === 'string' && KNOWN_CACHE_KINDS.has(record.kind);
+}
+
+function isNullCacheValue(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return record[NULL_CACHE_ENTRY_MARKER] === true;
 }
 
 function decodeSeededPrerenderValue(
@@ -282,7 +303,9 @@ export default class BunSqliteIncrementalCacheHandler
   ): Promise<CacheHandlerValue | null> {
     const store = getSharedPrerenderCacheStore();
     const row = store.get(cacheKey);
-    if (!row) return null;
+    if (!row) {
+      return null;
+    }
 
     const queryTags = getFetchContextTags(ctx);
     const storedTags = readStoredHeaderTags(row.headers);
@@ -308,8 +331,14 @@ export default class BunSqliteIncrementalCacheHandler
     let value: IncrementalCacheValue | null = null;
     let decoded = false;
     try {
-      value = decodeCacheValue(payload);
-      decoded = true;
+      const decodedValue = decodeCacheValue(payload);
+      if (isNullCacheValue(decodedValue)) {
+        value = null;
+        decoded = true;
+      } else if (isCacheValue(decodedValue)) {
+        value = decodedValue;
+        decoded = true;
+      }
     } catch {}
 
     if (!decoded) {
@@ -334,7 +363,22 @@ export default class BunSqliteIncrementalCacheHandler
     const store = getSharedPrerenderCacheStore();
 
     if (data === null || data === undefined) {
-      store.delete?.(cacheKey);
+      const now = Date.now();
+      const markerPayload = JSON.stringify({
+        [NULL_CACHE_ENTRY_MARKER]: true,
+      });
+      store.set(cacheKey, {
+        cacheKey,
+        pathname: cacheKey,
+        groupId: 0,
+        status: 200,
+        headers: {},
+        body: Buffer.from(markerPayload, 'utf8').toString('base64'),
+        bodyEncoding: 'base64',
+        createdAt: now,
+        revalidateAt: null,
+        expiresAt: null,
+      });
       return;
     }
 
