@@ -159,48 +159,6 @@ const manifest = await Bun.file(manifestPath).json();
 // conflict with this standalone server entry.
 delete process.env.NEXT_ADAPTER_PATH;
 
-function inferContentType(pathname) {
-  if (pathname.endsWith('.xml')) return 'application/xml';
-  if (pathname.endsWith('.webmanifest')) return 'application/manifest+json';
-  if (pathname.endsWith('.json')) return 'application/json';
-  if (pathname.endsWith('.txt')) return 'text/plain';
-  if (pathname.endsWith('.ico')) return 'image/x-icon';
-  if (pathname.endsWith('.png')) return 'image/png';
-  if (pathname.endsWith('.svg')) return 'image/svg+xml';
-  if (pathname.endsWith('.js')) return 'application/javascript';
-  if (pathname.endsWith('.css')) return 'text/css';
-  if (pathname.endsWith('.html')) return 'text/html; charset=utf-8';
-  return null;
-}
-
-const defaultStaticAssetCacheControl = 'public, max-age=0, must-revalidate';
-
-const staticAssetMap = new Map();
-if (Array.isArray(manifest.staticAssets)) {
-  for (const asset of manifest.staticAssets) {
-    if (!asset || typeof asset !== 'object') continue;
-    if (
-      typeof asset.pathname !== 'string' ||
-      asset.pathname.length === 0 ||
-      typeof asset.stagedPath !== 'string' ||
-      asset.stagedPath.length === 0
-    ) {
-      continue;
-    }
-    staticAssetMap.set(asset.pathname, {
-      filePath: path.join(adapterDir, asset.stagedPath),
-      contentType:
-        typeof asset.contentType === 'string' && asset.contentType.length > 0
-          ? asset.contentType
-          : inferContentType(asset.pathname),
-      cacheControl:
-        typeof asset.cacheControl === 'string' && asset.cacheControl.length > 0
-          ? asset.cacheControl
-          : defaultStaticAssetCacheControl,
-    });
-  }
-}
-
 // Tell the cache handler where to find cache.db
 process.env.BUN_ADAPTER_CACHE_DB_PATH = path.join(adapterDir, 'cache.db');
 
@@ -291,48 +249,85 @@ const app = createNext({
 await app.prepare();
 const handle = app.getRequestHandler();
 
+function normalizeCacheControlHeader(value) {
+  const raw = Array.isArray(value) ? value.join(', ') : String(value ?? '');
+  const normalized = raw.trim();
+  if (normalized.length === 0) return raw;
+
+  const lower = normalized.toLowerCase();
+  if (lower.includes('immutable')) {
+    return normalized;
+  }
+
+  if (
+    lower.includes('s-maxage=') ||
+    lower === 'private, no-cache, no-store, max-age=0, must-revalidate'
+  ) {
+    return 'public, max-age=0, must-revalidate';
+  }
+
+  return normalized;
+}
+
+function patchCacheControlHeader(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return;
+  }
+
+  const originalSetHeader = res.setHeader.bind(res);
+  res.setHeader = (name, value) => {
+    if (typeof name === 'string' && name.toLowerCase() === 'cache-control') {
+      return originalSetHeader(name, normalizeCacheControlHeader(value));
+    }
+    return originalSetHeader(name, value);
+  };
+
+  const originalWriteHead = res.writeHead.bind(res);
+  res.writeHead = (statusCode, statusMessage, headers) => {
+    let resolvedStatusMessage = statusMessage;
+    let resolvedHeaders = headers;
+
+    if (
+      resolvedHeaders === undefined &&
+      resolvedStatusMessage &&
+      typeof resolvedStatusMessage === 'object' &&
+      !Array.isArray(resolvedStatusMessage)
+    ) {
+      resolvedHeaders = resolvedStatusMessage;
+      resolvedStatusMessage = undefined;
+    }
+
+    if (resolvedHeaders && typeof resolvedHeaders === 'object') {
+      for (const key of Object.keys(resolvedHeaders)) {
+        if (key.toLowerCase() !== 'cache-control') {
+          continue;
+        }
+        resolvedHeaders[key] = normalizeCacheControlHeader(resolvedHeaders[key]);
+      }
+    }
+
+    if (resolvedStatusMessage === undefined) {
+      return originalWriteHead(statusCode, resolvedHeaders);
+    }
+
+    return originalWriteHead(statusCode, resolvedStatusMessage, resolvedHeaders);
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   // Normalize Bun's incoming headers into a plain mutable object so Next can
   // safely patch/strip headers during RSC/action flows.
   req.headers = { ...req.headers };
+  patchCacheControlHeader(req, res);
 
-  // Serve adapter-staged static assets directly. Some static metadata routes
-  // are emitted as .body files and are not always represented in prerender
-  // cache outputs.
-  const requestTarget = req.url || '/';
-  if (req.method === 'GET' || req.method === 'HEAD') {
-    let pathname = null;
-    try {
-      pathname = new URL(requestTarget, protocol + '://' + appHostname).pathname;
-    } catch {}
-
-    if (pathname) {
-      const staticAsset = staticAssetMap.get(pathname);
-      if (staticAsset) {
-        try {
-          const file = Bun.file(staticAsset.filePath);
-          if (await file.exists()) {
-            if (staticAsset.contentType) {
-              res.setHeader('content-type', staticAsset.contentType);
-            }
-            if (staticAsset.cacheControl) {
-              res.setHeader('cache-control', staticAsset.cacheControl);
-            }
-            if (Number.isFinite(file.size) && file.size >= 0) {
-              res.setHeader('content-length', String(file.size));
-            }
-            res.statusCode = 200;
-            if (req.method === 'HEAD') {
-              res.end();
-              return;
-            }
-            const body = Buffer.from(await file.arrayBuffer());
-            res.end(body);
-            return;
-          }
-        } catch {}
-      }
-    }
+  const userAgent =
+    typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
+  if (
+    (req.method === 'GET' || req.method === 'HEAD') &&
+    userAgent.includes('node-fetch')
+  ) {
+    req.headers.connection = 'close';
+    res.setHeader('connection', 'close');
   }
 
   // Some Bun fetch requests use Accept: */* for RSC refetches. Force the
@@ -346,11 +341,6 @@ const server = http.createServer(async (req, res) => {
       delete req.headers['content-type'];
     }
   }
-
-  // Bun's Node HTTP compatibility can intermittently reset reused keep-alive
-  // sockets in long E2E runs. Force short-lived connections for stability.
-  req.headers.connection = 'close';
-  res.setHeader('connection', 'close');
 
   try {
     await handle(req, res);

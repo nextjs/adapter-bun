@@ -92,16 +92,40 @@ PORT=$PORT NEXT_DEPLOYMENT_ID="$NEXT_DEPLOYMENT_ID" VERCEL_IMMUTABLE_ASSET_TOKEN
 SERVER_PID=$!
 echo "$SERVER_PID" > "$NEXT_TEST_DIR/.adapter-server.pid"
 
-# 8. Wait for server to be ready
+# 8. Wait for server to be ready.
+# Use a plain TCP probe instead of an HTTP route probe so middleware fixtures
+# are not exercised during readiness checks.
+server_ready=0
 for i in $(seq 1 30); do
-  if curl -sf -o /dev/null "http://localhost:${PORT}/" 2>/dev/null; then break; fi
+  if PORT="$PORT" node -e "
+const net = require('node:net');
+const port = Number(process.env.PORT);
+const socket = net.connect({ host: '127.0.0.1', port });
+const done = (ok) => {
+  socket.destroy();
+  process.exit(ok ? 0 : 1);
+};
+socket.once('connect', () => done(true));
+socket.once('error', () => done(false));
+setTimeout(() => done(false), 750);
+" >/dev/null 2>&1; then
+    server_ready=1
+    break
+  fi
+
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-      echo "Server died. Logs:" >&2
-      cat "$NEXT_TEST_DIR/.adapter-server.log" >&2
-      exit 1
-    fi
+    echo "Server died. Logs:" >&2
+    cat "$NEXT_TEST_DIR/.adapter-server.log" >&2
+    exit 1
+  fi
   sleep 1
 done
+
+if [ "$server_ready" -ne 1 ]; then
+  echo "Server did not become ready within timeout. Logs:" >&2
+  cat "$NEXT_TEST_DIR/.adapter-server.log" >&2
+  exit 1
+fi
 
 # 9. Output URL (only thing on stdout)
 echo "http://localhost:${PORT}"
