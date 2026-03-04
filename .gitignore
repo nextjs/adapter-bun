@@ -3,6 +3,7 @@ node_modules
 .vercel
 .turbo
 dist
+bun-dist
 
 # This is a hack to get around the fact that `pnpm install`
 # does not run create the "bin" symlink if the file does not exist
