@@ -149,6 +149,7 @@ async function writeRuntimeNextConfig(
 
 const SERVER_ENTRY_TEMPLATE = `import path from 'node:path';
 import http from 'node:http';
+import { Readable } from 'node:stream';
 
 const adapterDir = import.meta.dirname;
 const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
@@ -171,11 +172,13 @@ const port =
     ? requestedPort
     : manifest.server.port;
 const listenHostname = manifest.server.hostname;
+const isWildcardHostname = (value) => value === '0.0.0.0' || value === '::';
 const configuredHostname = process.env.NEXT_HOSTNAME || '';
 const appHostname =
-  configuredHostname && configuredHostname !== '0.0.0.0'
+  configuredHostname &&
+  !isWildcardHostname(configuredHostname)
     ? configuredHostname
-    : listenHostname !== '0.0.0.0'
+    : !isWildcardHostname(listenHostname)
       ? listenHostname
       : 'localhost';
 const protocol = process.env.__NEXT_EXPERIMENTAL_HTTPS === '1' ? 'https' : 'http';
@@ -249,158 +252,75 @@ const app = createNext({
 await app.prepare();
 const handle = app.getRequestHandler();
 
-function normalizeWorkerPath(workerPath) {
-  const withoutAppPrefix = workerPath.startsWith('app/')
-    ? workerPath.slice('app/'.length)
-    : workerPath;
-  const withoutLeaf = withoutAppPrefix.replace(/\\/(page|route)$/, '');
-  if (withoutLeaf.length === 0) {
-    return '/';
-  }
-  return withoutLeaf.startsWith('/') ? withoutLeaf : '/' + withoutLeaf;
-}
-
-async function loadNodeActionWorkerPaths() {
-  const nodeActionWorkers = new Map();
-  const configuredDistDir =
-    typeof manifest.build?.distDir === 'string' && manifest.build.distDir.length > 0
-      ? manifest.build.distDir
-      : '.next';
-  const resolvedDistDir = path.isAbsolute(configuredDistDir)
-    ? configuredDistDir
-    : path.join(projectDir, configuredDistDir);
-  const serverReferenceManifestPath = path.join(
-    resolvedDistDir,
-    'server',
-    'server-reference-manifest.json'
-  );
-
-  try {
-    const parsedManifest = await Bun.file(serverReferenceManifestPath).json();
-    const nodeEntries =
-      parsedManifest &&
-      typeof parsedManifest === 'object' &&
-      parsedManifest.node &&
-      typeof parsedManifest.node === 'object'
-        ? parsedManifest.node
-        : {};
-
-    for (const [actionId, record] of Object.entries(nodeEntries)) {
-      if (!record || typeof record !== 'object') {
-        continue;
-      }
-
-      const workers =
-        record.workers && typeof record.workers === 'object' ? record.workers : null;
-      if (!workers) {
-        continue;
-      }
-
-      const firstWorkerPath = Object.keys(workers)[0];
-      if (!firstWorkerPath) {
-        continue;
-      }
-
-      nodeActionWorkers.set(actionId, normalizeWorkerPath(firstWorkerPath));
-    }
-  } catch (error) {
-    console.warn(
-      '[adapter-bun] failed to load server reference manifest for action fallback:',
-      error
-    );
-  }
-
-  return nodeActionWorkers;
-}
-
-const nodeActionWorkerPaths = await loadNodeActionWorkerPaths();
-
 function getSingleHeaderValue(value) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-async function maybeForwardActionRequestToNode(req, res) {
+async function prepareActionRequestBodyForBun(req) {
   if (req.method !== 'POST') {
-    return false;
+    return;
   }
 
   const actionId = getSingleHeaderValue(req.headers['next-action']);
   if (typeof actionId !== 'string' || actionId.length === 0) {
-    return false;
+    return;
   }
 
-  const nodeWorkerPath = nodeActionWorkerPaths.get(actionId);
-  if (!nodeWorkerPath) {
-    return false;
-  }
-
-  const rawUrl = typeof req.url === 'string' ? req.url : '/';
-  const parsedUrl = new URL(rawUrl, 'http://n');
-  if (parsedUrl.pathname === nodeWorkerPath) {
-    return false;
-  }
-
-  const internalOrigin =
-    process.env.__NEXT_PRIVATE_ORIGIN || protocol + '://' + appHostname + ':' + port;
-  const targetUrl = new URL(nodeWorkerPath + parsedUrl.search, internalOrigin);
-  const forwardedHeaders = {};
-
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (value === undefined) {
+  const chunks = [];
+  for await (const chunk of req) {
+    if (chunk === undefined || chunk === null) {
       continue;
     }
-    forwardedHeaders[name] = Array.isArray(value) ? value.join(', ') : String(value);
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
+  const requestBody = Buffer.concat(chunks);
 
-  forwardedHeaders['x-action-forwarded'] = '1';
-  if (!forwardedHeaders['x-forwarded-host']) {
-    forwardedHeaders['x-forwarded-host'] =
-      forwardedHeaders.host || appHostname + ':' + String(port);
+  // Bun's IncomingMessage can complete before Next attaches stream listeners
+  // for forwarded Server Actions. Replaying a buffered body keeps request
+  // consumption semantics stable while letting Next own action routing.
+  if (requestBody.length > 0) {
+    req.headers['content-length'] = String(requestBody.length);
+  } else {
+    req.headers['content-length'] = '0';
   }
-  if (!forwardedHeaders.origin) {
-    forwardedHeaders.origin = internalOrigin;
-  }
+  delete req.headers['transfer-encoding'];
 
-  const forwardedResponse = await fetch(targetUrl, {
-    method: 'POST',
-    headers: forwardedHeaders,
-    body: req,
-    duplex: 'half',
-    redirect: 'manual',
-  });
+  const replayStream = Readable.from(requestBody);
+  const originalOn = req.on.bind(req);
+  const originalOnce = req.once.bind(req);
+  const originalRemoveListener = req.removeListener.bind(req);
 
-  res.statusCode = forwardedResponse.status;
-  for (const [name, value] of forwardedResponse.headers) {
-    const lowerName = name.toLowerCase();
-    if (
-      lowerName === 'transfer-encoding' ||
-      lowerName === 'connection' ||
-      lowerName === 'content-encoding' ||
-      lowerName === 'content-length'
-    ) {
-      continue;
+  req.on = (event, listener) => {
+    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
+      replayStream.on(event, listener);
+      return req;
     }
-    res.setHeader(name, value);
-  }
+    return originalOn(event, listener);
+  };
 
-  if (!forwardedResponse.body) {
-    res.end();
-    return true;
-  }
-
-  const reader = forwardedResponse.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+  req.once = (event, listener) => {
+    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
+      replayStream.once(event, listener);
+      return req;
     }
-    if (value && value.length > 0) {
-      res.write(value);
-    }
-  }
+    return originalOnce(event, listener);
+  };
 
-  res.end();
-  return true;
+  req.removeListener = (event, listener) => {
+    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
+      replayStream.removeListener(event, listener);
+      return req;
+    }
+    return originalRemoveListener(event, listener);
+  };
+
+  req.pipe = replayStream.pipe.bind(replayStream);
+  req.read = replayStream.read.bind(replayStream);
+  req.pause = replayStream.pause.bind(replayStream);
+  req.resume = replayStream.resume.bind(replayStream);
+  req.setEncoding = replayStream.setEncoding.bind(replayStream);
+  req.unshift = replayStream.unshift.bind(replayStream);
+  req[Symbol.asyncIterator] = replayStream[Symbol.asyncIterator].bind(replayStream);
 }
 
 function normalizeCacheControlHeader(value) {
@@ -413,10 +333,7 @@ function normalizeCacheControlHeader(value) {
     return normalized;
   }
 
-  if (
-    lower.includes('s-maxage=') ||
-    lower === 'private, no-cache, no-store, max-age=0, must-revalidate'
-  ) {
+  if (lower.includes('s-maxage=')) {
     return 'public, max-age=0, must-revalidate';
   }
 
@@ -476,7 +393,10 @@ const server = http.createServer(async (req, res) => {
 
   const userAgent =
     typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
-  if (userAgent.includes('node-fetch')) {
+  if (
+    (req.method === 'GET' || req.method === 'HEAD') &&
+    userAgent.includes('node-fetch')
+  ) {
     req.headers.connection = 'close';
     res.setHeader('connection', 'close');
   }
@@ -494,9 +414,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    if (await maybeForwardActionRequestToNode(req, res)) {
-      return;
-    }
+    await prepareActionRequestBodyForBun(req);
     await handle(req, res);
   } catch (err) {
     console.error('[adapter-bun] error handling request:', err);
@@ -507,15 +425,26 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, listenHostname, () => {
+const handleListening = () => {
   const addr = server.address();
   const listenPort = typeof addr === 'object' && addr ? addr.port : port;
+  const formattedHostname =
+    typeof addr === 'object' && addr && typeof addr.address === 'string'
+      ? addr.address
+      : listenHostname;
   console.log(
     \`\\n  Next.js (\\x1b[36m\${manifest.build.nextVersion}\\x1b[0m) \\x1b[2m|\\x1b[0m adapter-bun\\n\` +
-    \`  Listening on http://\${listenHostname}:\${listenPort}\\n\` +
+    \`  Listening on http://\${formattedHostname}:\${listenPort}\\n\` +
     \`  Build ID: \${manifest.build.buildId}\\n\`
   );
-});
+};
+
+if (isWildcardHostname(listenHostname)) {
+  // Let Node choose an unspecified address so IPv6/IPv4 dual-stack works when available.
+  server.listen(port, handleListening);
+} else {
+  server.listen(port, listenHostname, handleListening);
+}
 `;
 
 async function writeServerEntry(outDir: string): Promise<void> {
