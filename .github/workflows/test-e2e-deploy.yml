@@ -13,7 +13,7 @@ on:
 jobs:
   build:
     name: Build Next.js + adapter
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-arm64-8-core
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +28,7 @@ jobs:
           fetch-depth: 25
 
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+        with: { node-version: "24.13.1" }
 
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: "latest" }
@@ -59,7 +59,7 @@ jobs:
   test:
     name: Tests (${{ matrix.group }})
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-arm64-8-core
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -93,7 +93,7 @@ jobs:
           key: build-${{ github.sha }}-${{ github.run_id }}
 
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+        with: { node-version: "24.13.1" }
 
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: "latest" }
