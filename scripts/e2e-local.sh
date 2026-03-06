@@ -64,6 +64,7 @@ cd "$NEXTJS_DIR"
 
 NEXT_TEST_MODE=deploy \
 NEXT_E2E_TEST_TIMEOUT=240000 \
+NEXT_EXTERNAL_TESTS_FILTERS="test/deploy-tests-manifest.json,$ADAPTER_BUN_DIR/test/deploy-tests-manifest.adapter-bun.json" \
 NEXT_TEST_DEPLOY_SCRIPT_PATH="$ADAPTER_BUN_DIR/scripts/e2e-deploy.sh" \
 NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH="$ADAPTER_BUN_DIR/scripts/e2e-logs.sh" \
 NEXT_TEST_CLEANUP_SCRIPT_PATH="$ADAPTER_BUN_DIR/scripts/e2e-cleanup.sh" \

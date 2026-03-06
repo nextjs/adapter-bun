@@ -116,7 +116,8 @@ jobs:
         env:
           NEXT_TEST_MODE: deploy
           NEXT_E2E_TEST_TIMEOUT: 240000
-          NEXT_EXTERNAL_TESTS_FILTERS: test/deploy-tests-manifest.json
+          NEXT_EXTERNAL_TESTS_FILTERS:
+            test/deploy-tests-manifest.json,${{ github.workspace }}/adapter-bun/test/deploy-tests-manifest.adapter-bun.json
           NEXT_TEST_DEPLOY_SCRIPT_PATH:
             ${{ github.workspace }}/adapter-bun/scripts/e2e-deploy.sh
           NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH:

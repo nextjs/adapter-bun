@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "suites": {},
+  "rules": {
+    "include": [],
+    "exclude": [
+      "test/e2e/app-dir/server-actions-redirect-middleware-rewrite/server-actions-redirect-middleware-rewrite.test.ts",
+      "test/e2e/middleware-fetches-with-any-http-method/index.test.ts",
+      "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts"
+    ]
+  }
+}
