@@ -28,7 +28,7 @@ jobs:
           fetch-depth: 25
 
       - uses: actions/setup-node@v4
-        with: { node-version: "24.13.1" }
+        with: { node-version: "20" }
 
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: "latest" }
@@ -93,7 +93,7 @@ jobs:
           key: build-${{ github.sha }}-${{ github.run_id }}
 
       - uses: actions/setup-node@v4
-        with: { node-version: "24.13.1" }
+        with: { node-version: "20" }
 
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: "latest" }
