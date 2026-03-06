@@ -323,12 +323,42 @@ async function prepareActionRequestBodyForBun(req) {
   req[Symbol.asyncIterator] = replayStream[Symbol.asyncIterator].bind(replayStream);
 }
 
-function normalizeCacheControlHeader(value) {
+function getHeaderValue(headers, name) {
+  if (!headers || typeof headers !== 'object') {
+    return undefined;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof key === 'string' && key.toLowerCase() === name.toLowerCase()) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeCacheControlHeader(req, value, nextCacheHeaderValue) {
   const raw = Array.isArray(value) ? value.join(', ') : String(value ?? '');
   const normalized = raw.trim();
   if (normalized.length === 0) return raw;
 
   const lower = normalized.toLowerCase();
+  const hasNextCacheMarker =
+    typeof nextCacheHeaderValue === 'string' && nextCacheHeaderValue.length > 0;
+  const isDataRequest =
+    typeof req.url === 'string' && req.url.includes('/_next/data/');
+
+  if (
+    hasNextCacheMarker &&
+    !isDataRequest &&
+    lower === 'private, no-cache, no-store, max-age=0, must-revalidate'
+  ) {
+    // Pages-router fallback HTML responses in deploy mode still flow through
+    // Next's private no-store branch on the first MISS. Deployed environments
+    // expose these as public must-revalidate responses instead.
+    return 'public, max-age=0, must-revalidate';
+  }
+
   if (lower.includes('immutable')) {
     return normalized;
   }
@@ -348,7 +378,10 @@ function patchCacheControlHeader(req, res) {
   const originalSetHeader = res.setHeader.bind(res);
   res.setHeader = (name, value) => {
     if (typeof name === 'string' && name.toLowerCase() === 'cache-control') {
-      return originalSetHeader(name, normalizeCacheControlHeader(value));
+      return originalSetHeader(
+        name,
+        normalizeCacheControlHeader(req, value, res.getHeader('x-nextjs-cache'))
+      );
     }
     return originalSetHeader(name, value);
   };
@@ -369,11 +402,18 @@ function patchCacheControlHeader(req, res) {
     }
 
     if (resolvedHeaders && typeof resolvedHeaders === 'object') {
+      const nextCacheHeaderValue =
+        getHeaderValue(resolvedHeaders, 'x-nextjs-cache') ??
+        res.getHeader('x-nextjs-cache');
       for (const key of Object.keys(resolvedHeaders)) {
         if (key.toLowerCase() !== 'cache-control') {
           continue;
         }
-        resolvedHeaders[key] = normalizeCacheControlHeader(resolvedHeaders[key]);
+        resolvedHeaders[key] = normalizeCacheControlHeader(
+          req,
+          resolvedHeaders[key],
+          nextCacheHeaderValue
+        );
       }
     }
 
@@ -393,10 +433,10 @@ const server = http.createServer(async (req, res) => {
 
   const userAgent =
     typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
-  if (
-    (req.method === 'GET' || req.method === 'HEAD') &&
-    userAgent.includes('node-fetch')
-  ) {
+  if (userAgent.includes('node-fetch')) {
+    // node-fetch@2 can reuse a keep-alive socket across mixed request methods
+    // and hit ECONNRESET against the Bun->Node bridge. Force connection close
+    // for its requests so each request gets a fresh socket.
     req.headers.connection = 'close';
     res.setHeader('connection', 'close');
   }

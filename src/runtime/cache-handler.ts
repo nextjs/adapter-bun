@@ -5,16 +5,41 @@ import type {
   Timestamp,
 } from 'next/dist/server/lib/cache-handlers/types';
 
+const CACHE_TAGS_HEADER = 'x-next-cache-tags';
+const CACHE_STALE_HEADER = 'x-next-cache-stale';
+
 function getStore() {
   return getSharedPrerenderCacheStore();
 }
 
 const pendingSets = new Map<string, Promise<void>>();
 
+function readStoredTags(headers: Record<string, string>): string[] {
+  const raw = headers[CACHE_TAGS_HEADER];
+  if (typeof raw !== 'string' || raw.length === 0) return [];
+  return raw
+    .split(',')
+    .map((tag) => tag.trim())
+    .filter((tag) => tag.length > 0);
+}
+
+function readStoredStale(
+  headers: Record<string, string>,
+  fallbackStale: number
+): number {
+  const raw = headers[CACHE_STALE_HEADER];
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return fallbackStale;
+  }
+
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallbackStale;
+}
+
 class CacheHandler implements NextUseCacheHandler {
   async get(
     cacheKey: string,
-    softTags: string[]
+    _softTags: string[]
   ): Promise<undefined | CacheEntry> {
     const pendingPromise = pendingSets.get(cacheKey);
     if (pendingPromise) {
@@ -25,29 +50,43 @@ class CacheHandler implements NextUseCacheHandler {
     const row = store.get(cacheKey);
     if (!row) return undefined;
 
-    // Check soft tags for expiration
-    if (softTags.length > 0) {
-      const tagEntries = store.getTagManifestEntries?.(softTags);
+    // Compute durations from absolute timestamps
+    let revalidateSec =
+      row.revalidateAt !== null
+        ? Math.max(0, Math.floor((row.revalidateAt - row.createdAt) / 1000))
+        : 31536000; // 1 year default
+    const expireSec =
+      row.expiresAt !== null
+        ? Math.max(0, Math.floor((row.expiresAt - row.createdAt) / 1000))
+        : revalidateSec * 2;
+    const tags = readStoredTags(row.headers);
+
+    if (tags.length > 0) {
+      const tagEntries = store.getTagManifestEntries?.(tags);
       if (tagEntries) {
-        for (const tag of softTags) {
+        const now = Date.now();
+        for (const tag of tags) {
           const tagEntry = tagEntries[tag];
           if (!tagEntry) continue;
-          // If tag was expired/staled after entry creation, entry is stale
+
+          const expiredAt = tagEntry.expiredAt;
           if (
-            tagEntry.expiredAt !== undefined &&
-            tagEntry.expiredAt > row.createdAt
+            typeof expiredAt === 'number' &&
+            expiredAt <= now &&
+            expiredAt > row.createdAt
           ) {
             return undefined;
           }
-          if (
-            tagEntry.staleAt !== undefined &&
-            tagEntry.staleAt > row.createdAt
-          ) {
-            return undefined;
+
+          const staleAt = tagEntry.staleAt;
+          if (typeof staleAt === 'number' && staleAt > row.createdAt) {
+            revalidateSec = -1;
           }
         }
       }
     }
+
+    const staleSec = readStoredStale(row.headers, revalidateSec);
 
     // Convert stored base64 body to ReadableStream
     const bodyBuffer = Buffer.from(row.body, 'base64');
@@ -57,23 +96,6 @@ class CacheHandler implements NextUseCacheHandler {
         controller.close();
       },
     });
-
-    // Extract tags from headers
-    const cacheTags = row.headers['x-next-cache-tags'];
-    const tags = cacheTags
-      ? cacheTags.split(',').map((t) => t.trim()).filter(Boolean)
-      : [];
-
-    // Compute durations from absolute timestamps
-    const revalidateSec =
-      row.revalidateAt !== null
-        ? Math.max(0, Math.floor((row.revalidateAt - row.createdAt) / 1000))
-        : 31536000; // 1 year default
-    const expireSec =
-      row.expiresAt !== null
-        ? Math.max(0, Math.floor((row.expiresAt - row.createdAt) / 1000))
-        : revalidateSec * 2;
-    const staleSec = revalidateSec;
 
     return {
       value: stream,
@@ -132,7 +154,8 @@ class CacheHandler implements NextUseCacheHandler {
         groupId: 0,
         status: 200,
         headers: {
-          'x-next-cache-tags': entry.tags.join(','),
+          ...(entry.tags.length > 0 ? { [CACHE_TAGS_HEADER]: entry.tags.join(',') } : {}),
+          [CACHE_STALE_HEADER]: String(entry.stale),
         },
         body,
         bodyEncoding: 'base64',
@@ -165,9 +188,6 @@ class CacheHandler implements NextUseCacheHandler {
       if (!entry) continue;
       if (entry.expiredAt !== undefined && entry.expiredAt > maxTimestamp) {
         maxTimestamp = entry.expiredAt;
-      }
-      if (entry.staleAt !== undefined && entry.staleAt > maxTimestamp) {
-        maxTimestamp = entry.staleAt;
       }
     }
 
