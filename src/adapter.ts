@@ -37,6 +37,10 @@ type PreviewProps = NonNullable<
   NonNullable<BunDeploymentManifest['runtime']>['previewProps']
 >;
 
+type RuntimeRoutingInfo = NonNullable<
+  NonNullable<BunDeploymentManifest['runtime']>['routing']
+>;
+
 function normalizeDeploymentHost(value: string | undefined): string | null {
   if (typeof value !== 'string') {
     return null;
@@ -103,6 +107,22 @@ function toJsonRecord(value: unknown): Record<string, unknown> {
     return {};
   }
   return value as Record<string, unknown>;
+}
+
+function readRuntimeRoutingInfo(ctx: BuildCompleteContext): RuntimeRoutingInfo {
+  const configRecord = toJsonRecord(ctx.config);
+  const originalRewrites = toJsonRecord(configRecord._originalRewrites);
+  const beforeFiles = Array.isArray(originalRewrites.beforeFiles)
+    ? originalRewrites.beforeFiles
+    : [];
+  const hasMiddleware = Boolean(ctx.outputs.middleware);
+  const hasBeforeFilesRewrites = beforeFiles.length > 0;
+
+  return {
+    hasMiddleware,
+    hasBeforeFilesRewrites,
+    staticAssetFastPathEnabled: !hasMiddleware && !hasBeforeFilesRewrites,
+  };
 }
 
 function createRuntimeNextConfig(
@@ -252,6 +272,22 @@ const app = createNext({
 });
 await app.prepare();
 const handle = app.getRequestHandler();
+const routingConfig =
+  manifest.runtime &&
+  typeof manifest.runtime === 'object' &&
+  manifest.runtime.routing &&
+  typeof manifest.runtime.routing === 'object'
+    ? manifest.runtime.routing
+    : {};
+const staticAssetFastPathEnabled = Boolean(routingConfig.staticAssetFastPathEnabled);
+const staticAssetsByPathname = staticAssetFastPathEnabled
+  ? new Map(
+      (Array.isArray(manifest.staticAssets) ? manifest.staticAssets : []).map((asset) => [
+        asset.pathname,
+        asset,
+      ])
+    )
+  : null;
 
 function getSingleHeaderValue(value) {
   return Array.isArray(value) ? value[0] : value;
@@ -426,7 +462,115 @@ function patchCacheControlHeader(req, res) {
   };
 }
 
-const server = http.createServer(async (req, res) => {
+function shouldProxyRequestBody(method) {
+  return method !== 'GET' && method !== 'HEAD';
+}
+
+function getForwardedPort(url) {
+  if (url.port) {
+    return url.port;
+  }
+  return url.protocol === 'https:' ? '443' : '80';
+}
+
+function buildProxyHeaders(request, server) {
+  const headers = new Headers(request.headers);
+  const url = new URL(request.url);
+
+  if (!headers.has('host')) {
+    headers.set('host', url.host);
+  }
+  if (!headers.has('x-forwarded-host')) {
+    headers.set('x-forwarded-host', url.host);
+  }
+  if (!headers.has('x-forwarded-proto')) {
+    headers.set('x-forwarded-proto', url.protocol.slice(0, -1));
+  }
+  if (!headers.has('x-forwarded-port')) {
+    headers.set('x-forwarded-port', getForwardedPort(url));
+  }
+  headers.set('accept-encoding', 'identity');
+
+  if (!headers.has('x-forwarded-for')) {
+    const requestIp = server.requestIP(request);
+    if (requestIp && typeof requestIp.address === 'string' && requestIp.address.length > 0) {
+      headers.set('x-forwarded-for', requestIp.address);
+    }
+  }
+
+  if (headers.get('rsc') === '1') {
+    const accept = headers.get('accept');
+    if (!accept || accept === '*/*') {
+      headers.set('accept', 'text/x-component');
+    }
+    if (request.method === 'GET' && headers.has('content-type')) {
+      headers.delete('content-type');
+    }
+  }
+
+  return headers;
+}
+
+function sanitizeProxyResponse(response) {
+  const headers = new Headers(response.headers);
+  headers.delete('connection');
+  headers.delete('keep-alive');
+  headers.delete('transfer-encoding');
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function getStaticAsset(request) {
+  if (!staticAssetsByPathname) {
+    return null;
+  }
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return null;
+  }
+
+  const pathname = new URL(request.url).pathname;
+  return staticAssetsByPathname.get(pathname) ?? null;
+}
+
+function buildStaticAssetHeaders(file, asset) {
+  const headers = new Headers();
+  if (asset.cacheControl) {
+    headers.set('cache-control', asset.cacheControl);
+  }
+
+  const contentType = asset.contentType || file.type;
+  if (contentType) {
+    headers.set('content-type', contentType);
+  }
+  if (typeof file.size === 'number' && Number.isFinite(file.size) && file.size >= 0) {
+    headers.set('content-length', String(file.size));
+  }
+
+  return headers;
+}
+
+function serveStaticAsset(request, asset) {
+  const file = Bun.file(path.join(adapterDir, asset.stagedPath));
+  const headers = buildStaticAssetHeaders(file, asset);
+
+  if (request.method === 'HEAD') {
+    return new Response(null, {
+      status: 200,
+      headers,
+    });
+  }
+
+  return new Response(file, {
+    status: 200,
+    headers,
+  });
+}
+
+const backendServer = http.createServer(async (req, res) => {
   // Normalize Bun's incoming headers into a plain mutable object so Next can
   // safely patch/strip headers during RSC/action flows.
   req.headers = { ...req.headers };
@@ -466,26 +610,73 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+const backendOrigin = await new Promise((resolve, reject) => {
+  const handleError = (error) => {
+    backendServer.off('listening', handleListening);
+    reject(error);
+  };
+
+  const handleListening = () => {
+    backendServer.off('error', handleError);
+    const addr = backendServer.address();
+    if (!addr || typeof addr === 'string') {
+      reject(new Error('[adapter-bun] failed to resolve Next.js backend address'));
+      return;
+    }
+    resolve('http://127.0.0.1:' + addr.port);
+  };
+
+  backendServer.once('error', handleError);
+  backendServer.listen(0, '127.0.0.1', handleListening);
+});
+
+async function proxyToNext(request, server) {
+  const requestUrl = new URL(request.url);
+  const targetUrl = new URL(requestUrl.pathname + requestUrl.search, backendOrigin);
+
+  const response = await fetch(targetUrl, {
+    method: request.method,
+    headers: buildProxyHeaders(request, server),
+    body: shouldProxyRequestBody(request.method) ? request.body : undefined,
+    redirect: 'manual',
+    signal: request.signal,
+  });
+
+  return sanitizeProxyResponse(response);
+}
+
+const server = Bun.serve({
+  port,
+  hostname: listenHostname,
+  fetch(request, bunServer) {
+    const staticAsset = getStaticAsset(request);
+    if (staticAsset) {
+      return serveStaticAsset(request, staticAsset);
+    }
+
+    return proxyToNext(request, bunServer);
+  },
+  error(error) {
+    console.error('[adapter-bun] error handling request:', error);
+    return new Response('Internal Server Error', {
+      status: 500,
+      headers: {
+        'content-type': 'text/plain',
+      },
+    });
+  },
+});
+
 const handleListening = () => {
-  const addr = server.address();
-  const listenPort = typeof addr === 'object' && addr ? addr.port : port;
-  const formattedHostname =
-    typeof addr === 'object' && addr && typeof addr.address === 'string'
-      ? addr.address
-      : listenHostname;
   console.log(
     \`\\n  Next.js (\\x1b[36m\${manifest.build.nextVersion}\\x1b[0m) \\x1b[2m|\\x1b[0m adapter-bun\\n\` +
-    \`  Listening on http://\${formattedHostname}:\${listenPort}\\n\` +
-    \`  Build ID: \${manifest.build.buildId}\\n\`
+    \`  Listening on http://\${listenHostname}:\${port}\\n\` +
+    \`  Build ID: \${manifest.build.buildId}\\n\` +
+    \`  Static assets: \${staticAssetFastPathEnabled ? 'Bun.serve fast path enabled' : 'proxied through Next.js'}\\n\`
   );
 };
 
-if (isWildcardHostname(listenHostname)) {
-  // Let Node choose an unspecified address so IPv6/IPv4 dual-stack works when available.
-  server.listen(port, handleListening);
-} else {
-  server.listen(port, listenHostname, handleListening);
-}
+handleListening();
 `;
 
 async function writeServerEntry(outDir: string): Promise<void> {
@@ -711,6 +902,7 @@ async function onBuildComplete(
   const port = options.port ?? DEFAULT_PORT;
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
   const previewProps = await readPreviewProps(ctx);
+  const routing = readRuntimeRoutingInfo(ctx);
 
   const deploymentManifest = buildDeploymentManifest({
     adapterName: ADAPTER_NAME,
@@ -722,6 +914,7 @@ async function onBuildComplete(
     port,
     hostname,
     previewProps,
+    routing,
   });
 
   await writeJsonFile(

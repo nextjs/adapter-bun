@@ -55,13 +55,12 @@ export default createBunAdapter({
 - **App Router** — static pages, dynamic SSR, streaming, `generateStaticParams`
 - **Pages Router** — `getStaticProps`, `getServerSideProps`, `getStaticPaths` with fallback
 - **API Routes** — both app route handlers and pages API routes
-- **Middleware** — edge middleware with rewrites, redirects, and response headers
+- **Middleware** — handled by Next.js' runtime
 - **ISR** — time-based revalidation and on-demand revalidation via `revalidateTag()`, `revalidatePath()`, and `res.revalidate()`
 - **Image optimization** — `next/image` backed by Sharp
 - **Draft mode** — preview bypass cookies
 - **`next.config` routing** — headers, redirects, rewrites (including external rewrites)
 - **Mixed routers** — app and pages router in the same project
-- **Edge runtime** — edge functions and middleware run in an isolated `edge-runtime` sandbox
 
 ## How it works
 
@@ -72,70 +71,58 @@ The adapter hooks into Next.js via the `onBuildComplete` callback. It takes the 
 ```
 bun-dist/
   server.js                 # entry point (Bun.serve)
-  deployment-manifest.json  # routes, functions, assets, config
-  cache.db                  # SQLite — prerender + image cache
-  bundle/                   # function artifacts (route handlers)
+  deployment-manifest.json  # assets, build metadata, runtime flags
+  cache.db                  # SQLite cache for prerender and incremental data
+  runtime-next-config.json  # serialized Next config for runtime boot
   static/                   # static assets (/_next/static + public/)
-  runtime/                  # router, cache, invokers
-  node_modules/             # traced dependencies
+  runtime/                  # SQLite-backed cache handlers
 ```
 
-Functions are consolidated into a shared `bundle/` directory with deduplicated assets. Prerender seeds (SSG pages) are written into the SQLite cache so they're served immediately on first request.
+Prerender seeds (SSG pages) are written into the SQLite cache during build so they are available immediately on first request.
 
 ### Runtime
 
-`server.js` starts a Bun HTTP server. Each request flows through:
+`server.js` starts two layers:
 
-1. **Route resolution** — `@next/routing` matches the URL against the route graph (middleware routes, file-based routes, dynamic routes, config rewrites/redirects)
-2. **Middleware** — if the app has middleware, it runs in an edge runtime sandbox and can rewrite, redirect, or modify headers
-3. **Dispatch** — the matched route is handed to the appropriate handler:
-   - **Static** — file served from `static/` with appropriate cache headers
-   - **Prerender (ISR)** — served from SQLite cache; stale entries trigger background revalidation
-   - **Function** — Node.js handler invoked via a per-request HTTP server; edge handlers run in `edge-runtime`
-   - **Image** — optimized via Sharp with its own cache layer
-   - **External rewrite** — proxied to the external URL
-4. **Cache evaluation** — prerender responses are checked against the tag manifest for staleness/expiration before serving
+1. **Public listener** — `Bun.serve` accepts incoming requests.
+2. **Static fast path** — when the build has no middleware and no `beforeFiles` rewrites, `Bun.serve` can serve staged static assets directly from `bun-dist/static`.
+3. **Next.js backend** — all other requests are proxied to an internal loopback `http.createServer`, which calls `app.getRequestHandler()`.
+4. **Cache integration** — Next.js uses SQLite-backed cache handlers staged into `bun-dist/runtime`.
+
+This keeps Bun at the edge of the deployment while still relying on Next.js' own runtime for routing, middleware, rendering, and rewrites when needed.
 
 ### Caching
 
 The adapter uses SQLite (`cache.db`) for persistent caching:
 
 - **Prerender cache** — stores rendered pages with TTL and tag-based invalidation
-- **Image cache** — stores optimized images with TTL
+- **Incremental/cache-components data** — stored through Next.js cache handlers
 - **Tag manifest** — tracks `revalidateTag()` / `revalidatePath()` invalidations
 - **Revalidation locks** — prevents duplicate background regeneration
 
-When `revalidateTag()` or `revalidatePath()` is called inside a route handler or server action, the adapter bridges Next.js's in-memory tag manifest with the SQLite store so invalidations persist across requests.
+Cached bodies are stored as SQLite BLOBs rather than base64 text.
 
 ### On-demand revalidation
 
 Three mechanisms are supported:
 
-- **`revalidateTag(tag)`** / **`revalidatePath(path)`** from `next/cache` — works inside route handlers and server actions; synced to SQLite via the tag manifest bridge
-- **`res.revalidate(path)`** — pages router ISR; the adapter patches `fetch` to rewrite self-referencing HTTPS calls to HTTP
+- **`revalidateTag(tag)`** / **`revalidatePath(path)`** from `next/cache`
+- **`res.revalidate(path)`** for pages-router ISR
 
 ## Project structure
 
 ```
 src/
-  adapter.ts                # build hook + server template
-  manifest.ts               # deployment + router manifest generation
-  staging.ts                # stages assets, functions, prerender seeds
+  adapter.ts                # build hook + generated server template
+  manifest.ts               # deployment manifest generation
+  staging.ts                # stages assets and writes deployment files
   types.ts                  # adapter types
   runtime/
-    router.ts               # request router (createRouterRuntime)
-    isr.ts                  # prerender cache logic + types
-    image.ts                # image optimization cache
+    cache-handler.ts        # Next.js cache-components handler
+    cache-store.ts          # shared SQLite store access
+    incremental-cache-handler.ts # Next.js incremental cache handler
+    isr.ts                  # cache entry types
     sqlite-cache.ts         # SQLite cache stores
-    function-invoker.ts     # dispatches to node/edge invokers
-    function-invoker-node.ts   # Node.js function runtime
-    function-invoker-edge.ts   # Edge function runtime + middleware
-    function-invoker-shared.ts # shared invoker utilities
-    static.ts               # static file serving
-    revalidate.ts           # background revalidation queue
-    tag-manifest-bridge.ts  # syncs Next.js revalidateTag to SQLite
-    next-routing.ts         # lazy-loads @next/routing
-    types.ts                # runtime types
 ```
 
 ## Development

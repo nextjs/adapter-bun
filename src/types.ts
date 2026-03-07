@@ -63,6 +63,11 @@ export interface BunDeploymentManifest {
       previewModeSigningKey: string;
       previewModeEncryptionKey: string;
     } | null;
+    routing?: {
+      hasMiddleware: boolean;
+      hasBeforeFilesRewrites: boolean;
+      staticAssetFastPathEnabled: boolean;
+    };
   };
   staticAssets: BunStaticAsset[];
   summary: {

@@ -41,6 +41,7 @@ export function buildDeploymentManifest({
   port,
   hostname,
   previewProps,
+  routing,
 }: {
   adapterName: string;
   adapterOutDir: string;
@@ -53,6 +54,11 @@ export function buildDeploymentManifest({
   previewProps?: BunDeploymentManifest['runtime'] extends infer Runtime
     ? Runtime extends { previewProps?: infer Preview }
       ? Preview
+      : never
+    : never;
+  routing?: BunDeploymentManifest['runtime'] extends infer Runtime
+    ? Runtime extends { routing?: infer Routing }
+      ? Routing
       : never
     : never;
 }): BunDeploymentManifest {
@@ -80,6 +86,11 @@ export function buildDeploymentManifest({
     pathnames,
     runtime: {
       previewProps: previewProps ?? null,
+      routing: routing ?? {
+        hasMiddleware: false,
+        hasBeforeFilesRewrites: false,
+        staticAssetFastPathEnabled: false,
+      },
     },
     staticAssets,
     summary: {

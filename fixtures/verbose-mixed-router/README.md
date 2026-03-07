@@ -2,6 +2,8 @@
 
 This fixture intentionally mixes App Router and Pages Router behaviors for Bun adapter conformance coverage.
 
+Because it includes both middleware and `beforeFiles` rewrites, this fixture intentionally disables the adapter's Bun.serve static-asset fast path. Static requests in this fixture are expected to flow through the internal Next.js backend.
+
 ## Included coverage
 
 - App Router routes:
