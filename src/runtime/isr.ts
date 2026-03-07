@@ -1,13 +1,15 @@
 export const NEXT_CACHE_TAGS_HEADER = 'x-next-cache-tags';
 
+export type CacheBodyEncoding = 'binary' | 'base64';
+
 export interface PrerenderCacheEntry {
   cacheKey: string;
   pathname: string;
   groupId: number;
   status: number;
   headers: Record<string, string>;
-  body: string;
-  bodyEncoding: 'base64';
+  body: Uint8Array | string;
+  bodyEncoding: CacheBodyEncoding;
   createdAt: number;
   revalidateAt: number | null;
   expiresAt: number | null;
@@ -60,8 +62,8 @@ export interface ImageCacheEntry {
   pathname: string;
   status: number;
   headers: Record<string, string>;
-  body: string;
-  bodyEncoding: 'base64';
+  body: Uint8Array | string;
+  bodyEncoding: CacheBodyEncoding;
   createdAt: number;
   revalidateAt: number | null;
   expiresAt: number | null;

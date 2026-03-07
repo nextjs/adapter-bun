@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite';
 import path from 'node:path';
 import type {
+  CacheBodyEncoding,
   PrerenderCacheEntry,
   PrerenderCacheStore,
   PrerenderRevalidateTarget,
@@ -22,8 +23,8 @@ CREATE TABLE IF NOT EXISTS prerender_entries (
   group_id INTEGER NOT NULL,
   status INTEGER NOT NULL,
   headers TEXT NOT NULL,
-  body TEXT NOT NULL,
-  body_encoding TEXT NOT NULL DEFAULT 'base64',
+  body BLOB NOT NULL,
+  body_encoding TEXT NOT NULL DEFAULT 'binary',
   created_at INTEGER NOT NULL,
   revalidate_at INTEGER,
   expires_at INTEGER,
@@ -37,8 +38,8 @@ CREATE TABLE IF NOT EXISTS image_entries (
   pathname TEXT NOT NULL,
   status INTEGER NOT NULL,
   headers TEXT NOT NULL,
-  body TEXT NOT NULL,
-  body_encoding TEXT NOT NULL DEFAULT 'base64',
+  body BLOB NOT NULL,
+  body_encoding TEXT NOT NULL DEFAULT 'binary',
   created_at INTEGER NOT NULL,
   revalidate_at INTEGER,
   expires_at INTEGER
@@ -79,6 +80,69 @@ function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
+type SqliteBodyValue = Uint8Array | string;
+
+type PrerenderEntryRow = {
+  cache_key: string;
+  pathname: string;
+  group_id: number;
+  status: number;
+  headers: string;
+  body: SqliteBodyValue;
+  body_encoding: string;
+  created_at: number;
+  revalidate_at: number | null;
+  expires_at: number | null;
+  cache_query: string | null;
+  cache_headers: string | null;
+};
+
+type ImageEntryRow = {
+  cache_key: string;
+  pathname: string;
+  status: number;
+  headers: string;
+  body: SqliteBodyValue;
+  body_encoding: string;
+  created_at: number;
+  revalidate_at: number | null;
+  expires_at: number | null;
+};
+
+function normalizeStoredBody(
+  body: SqliteBodyValue,
+  bodyEncoding: string
+): {
+  body: SqliteBodyValue;
+  bodyEncoding: CacheBodyEncoding;
+} {
+  if (bodyEncoding === 'binary') {
+    if (body instanceof Uint8Array) {
+      return {
+        body,
+        bodyEncoding: 'binary',
+      };
+    }
+
+    return {
+      body: new TextEncoder().encode(body),
+      bodyEncoding: 'binary',
+    };
+  }
+
+  if (typeof body === 'string') {
+    return {
+      body,
+      bodyEncoding: 'base64',
+    };
+  }
+
+  return {
+    body: Buffer.from(body).toString('utf8'),
+    bodyEncoding: 'base64',
+  };
+}
+
 export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
   #db: Database;
 
@@ -86,28 +150,17 @@ export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
     this.#db = db;
   }
 
-  #toPrerenderEntry(row: {
-    cache_key: string;
-    pathname: string;
-    group_id: number;
-    status: number;
-    headers: string;
-    body: string;
-    body_encoding: string;
-    created_at: number;
-    revalidate_at: number | null;
-    expires_at: number | null;
-    cache_query: string | null;
-    cache_headers: string | null;
-  }): PrerenderCacheEntry {
+  #toPrerenderEntry(row: PrerenderEntryRow): PrerenderCacheEntry {
+    const normalizedBody = normalizeStoredBody(row.body, row.body_encoding);
+
     return {
       cacheKey: row.cache_key,
       pathname: row.pathname,
       groupId: row.group_id,
       status: row.status,
       headers: JSON.parse(row.headers) as Record<string, string>,
-      body: row.body,
-      bodyEncoding: row.body_encoding as 'base64',
+      body: normalizedBody.body,
+      bodyEncoding: normalizedBody.bodyEncoding,
       createdAt: row.created_at,
       revalidateAt: row.revalidate_at,
       expiresAt: row.expires_at,
@@ -122,23 +175,7 @@ export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
 
   get(cacheKey: string): PrerenderCacheEntry | null {
     const row = this.#db
-      .query<
-        {
-          cache_key: string;
-          pathname: string;
-          group_id: number;
-          status: number;
-          headers: string;
-          body: string;
-          body_encoding: string;
-          created_at: number;
-          revalidate_at: number | null;
-          expires_at: number | null;
-          cache_query: string | null;
-          cache_headers: string | null;
-        },
-        [string]
-      >('SELECT * FROM prerender_entries WHERE cache_key = ?')
+      .query<PrerenderEntryRow, [string]>('SELECT * FROM prerender_entries WHERE cache_key = ?')
       .get(cacheKey);
 
     if (!row) return null;
@@ -150,23 +187,7 @@ export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
     const escapedPrefix = escapeLikePattern(cacheKeyPrefix);
     const pattern = `${escapedPrefix}%`;
     const rows = this.#db
-      .query<
-        {
-          cache_key: string;
-          pathname: string;
-          group_id: number;
-          status: number;
-          headers: string;
-          body: string;
-          body_encoding: string;
-          created_at: number;
-          revalidate_at: number | null;
-          expires_at: number | null;
-          cache_query: string | null;
-          cache_headers: string | null;
-        },
-        [string]
-      >(
+      .query<PrerenderEntryRow, [string]>(
         "SELECT * FROM prerender_entries WHERE cache_key LIKE ? ESCAPE '\\' ORDER BY cache_key ASC"
       )
       .all(pattern);
@@ -385,31 +406,20 @@ export class SqliteImageCacheStore implements ImageCacheStore {
 
   get(cacheKey: string): ImageCacheEntry | null {
     const row = this.#db
-      .query<
-        {
-          cache_key: string;
-          pathname: string;
-          status: number;
-          headers: string;
-          body: string;
-          body_encoding: string;
-          created_at: number;
-          revalidate_at: number | null;
-          expires_at: number | null;
-        },
-        [string]
-      >('SELECT * FROM image_entries WHERE cache_key = ?')
+      .query<ImageEntryRow, [string]>('SELECT * FROM image_entries WHERE cache_key = ?')
       .get(cacheKey);
 
     if (!row) return null;
+
+    const normalizedBody = normalizeStoredBody(row.body, row.body_encoding);
 
     return {
       cacheKey: row.cache_key,
       pathname: row.pathname,
       status: row.status,
       headers: JSON.parse(row.headers) as Record<string, string>,
-      body: row.body,
-      bodyEncoding: row.body_encoding as 'base64',
+      body: normalizedBody.body,
+      bodyEncoding: normalizedBody.bodyEncoding,
       createdAt: row.created_at,
       revalidateAt: row.revalidate_at,
       expiresAt: row.expires_at,

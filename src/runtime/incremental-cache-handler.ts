@@ -179,6 +179,35 @@ function decodeCacheValue(payload: string): unknown {
   });
 }
 
+function decodeStoredBodyBytes(row: {
+  body: Uint8Array | string;
+  bodyEncoding: 'binary' | 'base64';
+}): Uint8Array {
+  if (row.bodyEncoding === 'binary') {
+    return row.body instanceof Uint8Array
+      ? row.body
+      : new TextEncoder().encode(row.body);
+  }
+
+  const encodedBody =
+    typeof row.body === 'string' ? row.body : Buffer.from(row.body).toString('utf8');
+  return Buffer.from(encodedBody, 'base64');
+}
+
+function decodeStoredBodyBuffer(row: {
+  body: Uint8Array | string;
+  bodyEncoding: 'binary' | 'base64';
+}): Buffer {
+  return Buffer.from(decodeStoredBodyBytes(row));
+}
+
+function decodeStoredBodyText(row: {
+  body: Uint8Array | string;
+  bodyEncoding: 'binary' | 'base64';
+}): string {
+  return Buffer.from(decodeStoredBodyBytes(row)).toString('utf8');
+}
+
 function isCacheValue(value: unknown): value is IncrementalCacheValue {
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
@@ -194,7 +223,8 @@ function isNullCacheValue(value: unknown): boolean {
 function decodeSeededPrerenderValue(
   cacheKey: string,
   row: {
-    body: string;
+    body: Uint8Array | string;
+    bodyEncoding: 'binary' | 'base64';
     headers: Record<string, string>;
     status: number;
   },
@@ -204,16 +234,16 @@ function decodeSeededPrerenderValue(
   if (ctx.kind === 'APP_ROUTE') {
     return {
       kind: 'APP_ROUTE',
-      body: Buffer.from(row.body, 'base64'),
+      body: decodeStoredBodyBuffer(row),
       headers: row.headers,
       status: row.status,
     } as IncrementalCacheValue;
   }
 
   if (ctx.kind === 'APP_PAGE') {
-    const html = Buffer.from(row.body, 'base64').toString('utf8');
+    const html = decodeStoredBodyText(row);
     const rscRow = store.get(`${cacheKey}.rsc`);
-    const rscData = rscRow ? Buffer.from(rscRow.body, 'base64') : undefined;
+    const rscData = rscRow ? decodeStoredBodyBuffer(rscRow) : undefined;
     const segmentRows = store.findByPrefix(`${cacheKey}.segments/`);
     const segmentData = new Map<string, Buffer>();
 
@@ -228,7 +258,7 @@ function decodeSeededPrerenderValue(
       if (segmentPath.length === 0) {
         continue;
       }
-      segmentData.set(segmentPath, Buffer.from(segmentRow.body, 'base64'));
+      segmentData.set(segmentPath, decodeStoredBodyBuffer(segmentRow));
     }
 
     return {
@@ -243,7 +273,7 @@ function decodeSeededPrerenderValue(
   }
 
   if (ctx.kind === 'PAGES') {
-    const html = Buffer.from(row.body, 'base64').toString('utf8');
+    const html = decodeStoredBodyText(row);
     return {
       kind: 'PAGES',
       html,
@@ -327,7 +357,7 @@ export default class BunSqliteIncrementalCacheHandler
       }
     }
 
-    const payload = Buffer.from(row.body, 'base64').toString('utf8');
+    const payload = decodeStoredBodyText(row);
     let value: IncrementalCacheValue | null = null;
     let decoded = false;
     try {
@@ -373,8 +403,8 @@ export default class BunSqliteIncrementalCacheHandler
         groupId: 0,
         status: 200,
         headers: {},
-        body: Buffer.from(markerPayload, 'utf8').toString('base64'),
-        bodyEncoding: 'base64',
+        body: new TextEncoder().encode(markerPayload),
+        bodyEncoding: 'binary',
         createdAt: now,
         revalidateAt: null,
         expiresAt: null,
@@ -403,8 +433,8 @@ export default class BunSqliteIncrementalCacheHandler
       groupId: 0,
       status: 200,
       headers,
-      body: Buffer.from(encodeCacheValue(data), 'utf8').toString('base64'),
-      bodyEncoding: 'base64',
+      body: new TextEncoder().encode(encodeCacheValue(data)),
+      bodyEncoding: 'binary',
       createdAt: now,
       revalidateAt: toAbsoluteTimestamp(revalidateSeconds, now),
       expiresAt: toAbsoluteTimestamp(expireSeconds, now),

@@ -1,4 +1,4 @@
-import { copyFile, cp, lstat, mkdir, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type {
   BunStaticAsset,
@@ -108,7 +108,7 @@ async function copyToOutDir({
     );
   }
 
-  await copyFile(sourceCopyPath, destinationPath);
+  await Bun.write(destinationPath, Bun.file(sourceCopyPath));
 }
 
 async function findFilesRecursively(rootDir: string): Promise<string[]> {
@@ -129,9 +129,15 @@ async function findFilesRecursively(rootDir: string): Promise<string[]> {
   return files;
 }
 
-async function writeJson(filePath: string, payload: unknown): Promise<void> {
+export async function writeTextFile(filePath: string, contents: string): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  const writer = Bun.file(filePath).writer();
+  writer.write(contents);
+  await writer.end();
+}
+
+async function writeJson(filePath: string, payload: unknown): Promise<void> {
+  await writeTextFile(filePath, `${JSON.stringify(payload, null, 2)}\n`);
 }
 
 function recordByObjectKey(

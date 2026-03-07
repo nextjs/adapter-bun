@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
-import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { Database } from 'bun:sqlite';
 import type { NextAdapter } from 'next';
@@ -11,6 +11,7 @@ import {
 import { SCHEMA_SQL } from './runtime/sqlite-cache.ts';
 import {
   stageStaticAssets,
+  writeTextFile,
   writeJsonFile,
 } from './staging.ts';
 import type {
@@ -68,7 +69,7 @@ async function readPreviewProps(
   const prerenderManifestPath = path.join(distDir, 'prerender-manifest.json');
 
   try {
-    const parsed = JSON.parse(await readFile(prerenderManifestPath, 'utf8')) as {
+    const parsed = (await Bun.file(prerenderManifestPath).json()) as {
       preview?: Record<string, unknown>;
     };
     const preview = parsed.preview;
@@ -488,7 +489,7 @@ if (isWildcardHostname(listenHostname)) {
 `;
 
 async function writeServerEntry(outDir: string): Promise<void> {
-  await writeFile(path.join(outDir, 'server.js'), SERVER_ENTRY_TEMPLATE, 'utf8');
+  await writeTextFile(path.join(outDir, 'server.js'), SERVER_ENTRY_TEMPLATE);
 }
 
 async function copyRuntimeModule(
@@ -498,9 +499,9 @@ async function copyRuntimeModule(
   const sourceDir = path.join(import.meta.dirname, 'runtime');
   const destDir = path.join(outDir, 'runtime');
   await mkdir(destDir, { recursive: true });
-  await copyFile(
-    path.join(sourceDir, moduleName),
-    path.join(destDir, moduleName)
+  await Bun.write(
+    path.join(destDir, moduleName),
+    Bun.file(path.join(sourceDir, moduleName))
   );
 }
 
@@ -611,7 +612,7 @@ async function seedPrerenderCache({
       groupId: number;
       status: number;
       headers: string;
-      body: string;
+      body: Uint8Array;
       tags: string[];
       revalidateAt: number | null;
       expiresAt: number | null;
@@ -621,8 +622,7 @@ async function seedPrerenderCache({
       const fallback = prerender.fallback!;
       const sourcePath = resolveSourcePath(repoRoot, fallback.filePath!);
 
-      const bodyBuffer = await Bun.file(sourcePath).arrayBuffer();
-      const body = Buffer.from(bodyBuffer).toString('base64');
+      const body = await Bun.file(sourcePath).bytes();
 
       const cacheKey = prerender.pathname;
 
@@ -666,7 +666,7 @@ async function seedPrerenderCache({
           entry.status,
           entry.headers,
           entry.body,
-          'base64',
+          'binary',
           createdAt,
           entry.revalidateAt,
           entry.expiresAt

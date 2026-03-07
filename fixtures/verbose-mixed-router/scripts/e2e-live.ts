@@ -123,11 +123,17 @@ async function waitForPayloadChange(
 function verifySqliteArtifacts(): void {
   const db = new Database('./bun-dist/cache.db', { readonly: true });
   try {
-    const incrementalRows = db
+    const prerenderRows = db
       .query<{ c: number }, [string]>(
         'SELECT COUNT(*) AS c FROM prerender_entries WHERE cache_key LIKE ?'
       )
-      .get('incremental:%').c;
+      .get('/%').c;
+
+    const binaryRows = db
+      .query<{ c: number }, [string, string]>(
+        'SELECT COUNT(*) AS c FROM prerender_entries WHERE typeof(body) = ? AND body_encoding = ?'
+      )
+      .get('blob', 'binary').c;
 
     const appRouterTag = db
       .query<{ stale_at: number | null; expired_at: number | null }, [string]>(
@@ -136,8 +142,12 @@ function verifySqliteArtifacts(): void {
       .get('app-router-tag');
 
     assert.ok(
-      incrementalRows > 0,
-      'Expected incremental-cache entries to be persisted in bun-dist/cache.db'
+      prerenderRows > 0,
+      'Expected prerender entries to be persisted in bun-dist/cache.db'
+    );
+    assert.ok(
+      binaryRows > 0,
+      'Expected prerender bodies to be stored as binary blobs in bun-dist/cache.db'
     );
     assert.ok(appRouterTag, 'Expected app-router-tag to exist in tag_manifest');
     assert.ok(

@@ -36,6 +36,21 @@ function readStoredStale(
   return Number.isFinite(parsed) ? parsed : fallbackStale;
 }
 
+function decodeStoredBodyBytes(row: {
+  body: Uint8Array | string;
+  bodyEncoding: 'binary' | 'base64';
+}): Uint8Array {
+  if (row.bodyEncoding === 'binary') {
+    return row.body instanceof Uint8Array
+      ? row.body
+      : new TextEncoder().encode(row.body);
+  }
+
+  const encodedBody =
+    typeof row.body === 'string' ? row.body : Buffer.from(row.body).toString('utf8');
+  return Buffer.from(encodedBody, 'base64');
+}
+
 class CacheHandler implements NextUseCacheHandler {
   async get(
     cacheKey: string,
@@ -88,11 +103,10 @@ class CacheHandler implements NextUseCacheHandler {
 
     const staleSec = readStoredStale(row.headers, revalidateSec);
 
-    // Convert stored base64 body to ReadableStream
-    const bodyBuffer = Buffer.from(row.body, 'base64');
+    const bodyBytes = decodeStoredBodyBytes(row);
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(new Uint8Array(bodyBuffer));
+        controller.enqueue(bodyBytes);
         controller.close();
       },
     });
@@ -142,7 +156,6 @@ class CacheHandler implements NextUseCacheHandler {
         offset += chunk.byteLength;
       }
 
-      const body = Buffer.from(combined).toString('base64');
       const now = Date.now();
       const store = getStore();
 
@@ -157,8 +170,8 @@ class CacheHandler implements NextUseCacheHandler {
           ...(entry.tags.length > 0 ? { [CACHE_TAGS_HEADER]: entry.tags.join(',') } : {}),
           [CACHE_STALE_HEADER]: String(entry.stale),
         },
-        body,
-        bodyEncoding: 'base64',
+        body: combined,
+        bodyEncoding: 'binary',
         createdAt,
         revalidateAt:
           entry.revalidate > 0 ? createdAt + entry.revalidate * 1000 : null,
