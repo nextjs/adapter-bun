@@ -466,6 +466,15 @@ function shouldProxyRequestBody(method) {
   return method !== 'GET' && method !== 'HEAD';
 }
 
+function getRequestUserAgent(request) {
+  const userAgent = request.headers.get('user-agent');
+  return typeof userAgent === 'string' ? userAgent : '';
+}
+
+function shouldForceConnectionClose(request) {
+  return getRequestUserAgent(request).includes('node-fetch');
+}
+
 function getForwardedPort(url) {
   if (url.port) {
     return url.port;
@@ -511,17 +520,93 @@ function buildProxyHeaders(request, server) {
   return headers;
 }
 
-function sanitizeProxyResponse(response) {
+function sanitizeProxyResponse(response, request) {
   const headers = new Headers(response.headers);
   headers.delete('connection');
   headers.delete('keep-alive');
   headers.delete('transfer-encoding');
+  if (shouldForceConnectionClose(request)) {
+    headers.set('connection', 'close');
+  }
 
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
     headers,
   });
+}
+
+function isHtmlStaticAsset(asset) {
+  return (
+    typeof asset.contentType === 'string' &&
+    asset.contentType.toLowerCase().startsWith('text/html')
+  );
+}
+
+function trimTrailingSlashes(pathname) {
+  if (pathname === '/') {
+    return pathname;
+  }
+  const trimmed = pathname.replace(/\\/+$/, '');
+  return trimmed.length > 0 ? trimmed : '/';
+}
+
+function getCanonicalStaticAssetPathname(asset) {
+  if (!isHtmlStaticAsset(asset) || asset.pathname === '/') {
+    return asset.pathname;
+  }
+  return manifest.build.trailingSlash ? asset.pathname + '/' : asset.pathname;
+}
+
+function pathnameLooksLikeFile(pathname) {
+  const normalizedPathname = trimTrailingSlashes(pathname);
+  const segments = normalizedPathname.split('/');
+  const lastSegment = segments[segments.length - 1] || '';
+  return lastSegment.includes('.');
+}
+
+function buildRedirectLocation(requestUrl, pathname) {
+  return pathname + requestUrl.search;
+}
+
+function createRedirectResponse(request, requestUrl, pathname) {
+  const response = Response.redirect(buildRedirectLocation(requestUrl, pathname), 308);
+  if (shouldForceConnectionClose(request)) {
+    response.headers.set('connection', 'close');
+  }
+  return response;
+}
+
+function maybeHandleTrailingSlashRedirect(request) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return null;
+  }
+
+  const requestUrl = new URL(request.url);
+  const pathname = requestUrl.pathname;
+  if (pathname === '/' || pathname === '/.well-known' || pathname.startsWith('/.well-known/')) {
+    return null;
+  }
+
+  const trimmedPathname = trimTrailingSlashes(pathname);
+  const hasTrailingSlash = pathname.endsWith('/');
+  const looksLikeFile = pathnameLooksLikeFile(pathname);
+
+  if (manifest.build.trailingSlash) {
+    if (!looksLikeFile && !hasTrailingSlash) {
+      return createRedirectResponse(request, requestUrl, trimmedPathname + '/');
+    }
+    if (looksLikeFile && hasTrailingSlash) {
+      return createRedirectResponse(request, requestUrl, trimmedPathname);
+    }
+    return null;
+  }
+
+  if (hasTrailingSlash) {
+    return createRedirectResponse(request, requestUrl, trimmedPathname);
+  }
+
+  return null;
 }
 
 function getStaticAsset(request) {
@@ -532,8 +617,29 @@ function getStaticAsset(request) {
     return null;
   }
 
-  const pathname = new URL(request.url).pathname;
-  return staticAssetsByPathname.get(pathname) ?? null;
+  const requestUrl = new URL(request.url);
+  const pathname = requestUrl.pathname;
+
+  const directMatch = staticAssetsByPathname.get(pathname);
+  if (directMatch) {
+    return {
+      asset: directMatch,
+      pathname,
+    };
+  }
+
+  const trimmedPathname = trimTrailingSlashes(pathname);
+  if (trimmedPathname !== pathname) {
+    const normalizedMatch = staticAssetsByPathname.get(trimmedPathname);
+    if (normalizedMatch) {
+      return {
+        asset: normalizedMatch,
+        pathname,
+      };
+    }
+  }
+
+  return null;
 }
 
 function buildStaticAssetHeaders(file, asset) {
@@ -556,6 +662,9 @@ function buildStaticAssetHeaders(file, asset) {
 function serveStaticAsset(request, asset) {
   const file = Bun.file(path.join(adapterDir, asset.stagedPath));
   const headers = buildStaticAssetHeaders(file, asset);
+  if (shouldForceConnectionClose(request)) {
+    headers.set('connection', 'close');
+  }
 
   if (request.method === 'HEAD') {
     return new Response(null, {
@@ -642,18 +751,32 @@ async function proxyToNext(request, server) {
     signal: request.signal,
   });
 
-  return sanitizeProxyResponse(response);
+  return sanitizeProxyResponse(response, request);
 }
 
 const server = Bun.serve({
   port,
   hostname: listenHostname,
   fetch(request, bunServer) {
-    const staticAsset = getStaticAsset(request);
-    if (staticAsset) {
-      return serveStaticAsset(request, staticAsset);
+    const trailingSlashRedirect = maybeHandleTrailingSlashRedirect(request);
+    if (trailingSlashRedirect) {
+      return trailingSlashRedirect;
     }
 
+    const resolvedStaticAsset = getStaticAsset(request);
+    if (resolvedStaticAsset) {
+      const canonicalPathname = getCanonicalStaticAssetPathname(resolvedStaticAsset.asset);
+      if (
+        isHtmlStaticAsset(resolvedStaticAsset.asset) &&
+        resolvedStaticAsset.pathname !== canonicalPathname
+      ) {
+        return createRedirectResponse(request, new URL(request.url), canonicalPathname);
+      }
+
+      return serveStaticAsset(request, resolvedStaticAsset.asset);
+    }
+
+    bunServer.timeout(request, 0);
     return proxyToNext(request, bunServer);
   },
   error(error) {
