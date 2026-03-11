@@ -77,6 +77,7 @@ export interface BunPrerenderArtifact {
   id: BuildCompletePrerenderOutput['id'];
   pathname: BuildCompletePrerenderOutput['pathname'];
   parentOutputId: BuildCompletePrerenderOutput['parentOutputId'];
+  parentFallbackMode?: BuildCompletePrerenderOutput['parentFallbackMode'];
 }
 
 export interface BunDeploymentManifest {
@@ -103,6 +104,7 @@ export interface BunDeploymentManifest {
   pathnames: string[];
   prerenderedPathnames: string[];
   prerenderArtifacts: BunPrerenderArtifact[];
+  prerenderFallbackFalseMap: Record<string, string[]>;
   routeOutputs: BunRouteArtifact[];
   routeGraph: BunRouteGraph;
   middleware?: BunMiddlewareArtifact | null;

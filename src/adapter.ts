@@ -209,7 +209,51 @@ function serializePrerenderOutputs(ctx: BuildCompleteContext): BunPrerenderArtif
     id: output.id,
     pathname: output.pathname,
     parentOutputId: output.parentOutputId,
+    parentFallbackMode: output.parentFallbackMode,
   }));
+}
+
+function collectPrerenderFallbackFalseMap({
+  ctx,
+  routeOutputs,
+}: {
+  ctx: BuildCompleteContext;
+  routeOutputs: BunRouteArtifact[];
+}): Record<string, string[]> {
+  const routeOutputPathnameById = new Map(
+    routeOutputs.map((output) => [output.id, output.pathname])
+  );
+  const fallbackFalseMap = new Map<string, Set<string>>();
+
+  for (const prerender of ctx.outputs.prerenders) {
+    if (
+      prerender.parentFallbackMode !== false ||
+      prerender.pathname.includes('_next/data') ||
+      prerender.pathname.endsWith('.rsc')
+    ) {
+      continue;
+    }
+
+    const parentPathname = routeOutputPathnameById.get(prerender.parentOutputId);
+    if (!parentPathname) {
+      throw new Error(
+        `Invariant: missing parent output ${prerender.parentOutputId} for prerender ${JSON.stringify(prerender)}`
+      );
+    }
+
+    const existing = fallbackFalseMap.get(parentPathname) ?? new Set<string>();
+    existing.add(prerender.pathname);
+    fallbackFalseMap.set(parentPathname, existing);
+  }
+
+  const serialized = Object.fromEntries(
+    [...fallbackFalseMap.entries()].map(([pathname, values]) => [
+      pathname,
+      [...values].sort((a, b) => a.localeCompare(b)),
+    ])
+  );
+
+  return serialized;
 }
 
 function createRuntimeNextConfig(
@@ -495,6 +539,10 @@ async function onBuildComplete(
   const middleware = serializeMiddlewareOutput(ctx);
   const routeOutputs = serializeRouteOutputs(ctx);
   const prerenderArtifacts = serializePrerenderOutputs(ctx);
+  const prerenderFallbackFalseMap = collectPrerenderFallbackFalseMap({
+    ctx,
+    routeOutputs,
+  });
 
   const deploymentManifest = buildDeploymentManifest({
     adapterName: ADAPTER_NAME,
@@ -504,6 +552,7 @@ async function onBuildComplete(
     pathnames,
     prerenderedPathnames,
     prerenderArtifacts,
+    prerenderFallbackFalseMap,
     staticAssets,
     port,
     hostname,

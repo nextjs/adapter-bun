@@ -55,6 +55,7 @@ export function buildDeploymentManifest({
   pathnames,
   prerenderedPathnames,
   prerenderArtifacts,
+  prerenderFallbackFalseMap,
   staticAssets,
   port,
   hostname,
@@ -70,6 +71,7 @@ export function buildDeploymentManifest({
   pathnames: string[];
   prerenderedPathnames: string[];
   prerenderArtifacts: BunPrerenderArtifact[];
+  prerenderFallbackFalseMap: Record<string, string[]>;
   staticAssets: BunStaticAsset[];
   port: number;
   hostname: string;
@@ -106,6 +108,7 @@ export function buildDeploymentManifest({
     pathnames,
     prerenderedPathnames,
     prerenderArtifacts,
+    prerenderFallbackFalseMap,
     routeOutputs,
     routeGraph,
     middleware: middleware ?? null,

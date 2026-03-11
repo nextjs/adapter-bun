@@ -1035,16 +1035,6 @@ function decodeRouteInvocationMeta(value: string | undefined): RouteInvocationMe
   }
 }
 
-function isNoFallbackLikeError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return (
-    error.message === 'Internal: NoFallbackError' ||
-    error.message.includes('NoFallbackError')
-  );
-}
-
 function toResponseHeaders(headers: http.IncomingHttpHeaders): Headers {
   const normalized = new Headers();
   for (const [key, value] of Object.entries(headers)) {
@@ -1661,20 +1651,65 @@ function hasOutputPathname(
   return routeOutputsByPathname.has(pathname);
 }
 
+function normalizePathnameForFallbackMatch(pathname: string): string {
+  if (pathname === '/') {
+    return pathname;
+  }
+  return pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+}
+
 function findDynamicOutputForPathname(
   routeOutputs: BunRouteArtifact[],
-  requestPathname: string
+  requestPathname: string,
+  prerenderFallbackFalseByPathname?: Map<string, Set<string>>
 ): BunRouteArtifact | undefined {
+  const normalizedRequestPathname =
+    normalizePathnameForFallbackMatch(requestPathname);
+
   for (const output of routeOutputs) {
     if (!output.pathname.includes('[')) {
       continue;
     }
-    const params = extractRouteParamsFromPathname(output.pathname, requestPathname);
+    const params = extractRouteParamsFromPathname(
+      output.pathname,
+      normalizedRequestPathname
+    );
     if (params) {
+      const fallbackFalsePaths = prerenderFallbackFalseByPathname?.get(
+        output.pathname
+      );
+      if (
+        fallbackFalsePaths &&
+        !fallbackFalsePaths.has(normalizedRequestPathname)
+      ) {
+        continue;
+      }
       return output;
     }
   }
   return undefined;
+}
+
+function buildPrerenderFallbackFalseByPathname(
+  map: BunDeploymentManifest['prerenderFallbackFalseMap']
+): Map<string, Set<string>> {
+  const normalized = new Map<string, Set<string>>();
+  for (const [routePathname, fallbackPathnames] of Object.entries(map ?? {})) {
+    if (!Array.isArray(fallbackPathnames) || fallbackPathnames.length === 0) {
+      continue;
+    }
+    const values = new Set<string>();
+    for (const pathname of fallbackPathnames) {
+      if (typeof pathname !== 'string' || pathname.length === 0) {
+        continue;
+      }
+      values.add(normalizePathnameForFallbackMatch(pathname));
+    }
+    if (values.size > 0) {
+      normalized.set(routePathname, values);
+    }
+  }
+  return normalized;
 }
 
 function resolveNotFoundRouteOutput(
@@ -1682,8 +1717,76 @@ function resolveNotFoundRouteOutput(
 ): BunRouteArtifact | undefined {
   return (
     routeOutputsByPathname.get('/_not-found') ??
-    routeOutputsByPathname.get('/404')
+    routeOutputsByPathname.get('/404') ??
+    routeOutputsByPathname.get('/_error')
   );
+}
+
+function resolveServerErrorRouteOutput(
+  routeOutputsByPathname: Map<string, BunRouteArtifact>
+): BunRouteArtifact | undefined {
+  return (
+    routeOutputsByPathname.get('/500') ??
+    routeOutputsByPathname.get('/_error')
+  );
+}
+
+function trimBasePath(pathname: string, basePath: string): string {
+  const normalizedBasePath =
+    typeof basePath === 'string' && basePath !== '/' ? basePath : '';
+  if (!normalizedBasePath || !pathname.startsWith(normalizedBasePath)) {
+    return pathname;
+  }
+  const withoutBasePath = pathname.slice(normalizedBasePath.length);
+  return withoutBasePath.length > 0 ? withoutBasePath : '/';
+}
+
+function stripLocaleFromPathname(
+  pathname: string,
+  i18n: BunDeploymentManifest['build']['i18n']
+): string {
+  if (!i18n || !Array.isArray(i18n.locales) || i18n.locales.length === 0) {
+    return pathname;
+  }
+
+  const segments = pathname.split('/');
+  const localeSegment = segments[1];
+  if (
+    localeSegment &&
+    i18n.locales.some((locale) => locale.toLowerCase() === localeSegment.toLowerCase())
+  ) {
+    const withoutLocale = pathname.slice(localeSegment.length + 1);
+    return withoutLocale.length > 0 ? withoutLocale : '/';
+  }
+
+  return pathname;
+}
+
+function getLiteralStatusOverride({
+  requestPathname,
+  basePath,
+  i18n,
+  hasPrerenderRevalidateHeader,
+}: {
+  requestPathname: string;
+  basePath: string;
+  i18n: BunDeploymentManifest['build']['i18n'];
+  hasPrerenderRevalidateHeader: boolean;
+}): 404 | 500 | null {
+  let pathname = normalizePathnameForFallbackMatch(requestPathname);
+  pathname = normalizePathnameForFallbackMatch(trimBasePath(pathname, basePath));
+  pathname = normalizePathnameForFallbackMatch(
+    stripLocaleFromPathname(pathname, i18n)
+  );
+
+  if (pathname === '/404' && !hasPrerenderRevalidateHeader) {
+    return 404;
+  }
+  if (pathname === '/500') {
+    return 500;
+  }
+
+  return null;
 }
 
 export async function startServer(options?: StartServerOptions): Promise<void> {
@@ -1759,10 +1862,16 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
   const prerenderArtifactsByPathname = new Map(
     (manifest.prerenderArtifacts ?? []).map((artifact) => [artifact.pathname, artifact])
   );
+  const prerenderFallbackFalseByPathname = buildPrerenderFallbackFalseByPathname(
+    manifest.prerenderFallbackFalseMap
+  );
   const staticAssetsByPathname = new Map(
     (manifest.staticAssets ?? []).map((asset) => [asset.pathname, asset])
   );
   const notFoundRouteOutput = resolveNotFoundRouteOutput(routeOutputsByPathname);
+  const serverErrorRouteOutput = resolveServerErrorRouteOutput(
+    routeOutputsByPathname
+  );
 
   const nodeRouteHandlerCache = new Map<string, Promise<NodeRouteHandler>>();
   const edgeRouteHandlerCache = new Map<string, Promise<EdgeRouteHandler>>();
@@ -2006,6 +2115,184 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
     return middlewareHandlerPromise;
   }
 
+  function getNodeRequestUrl(req: http.IncomingMessage): URL {
+    return new URL(
+      req.url || '/',
+      `${getSingleHeaderValue(req.headers['x-forwarded-proto']) || 'http'}://${getSingleHeaderValue(req.headers.host) || appHostname}`
+    );
+  }
+
+  function buildNodeRequestMeta({
+    req,
+    requestUrl,
+    routeOutput,
+    invocationMeta,
+  }: {
+    req: http.IncomingMessage;
+    requestUrl: URL;
+    routeOutput: BunRouteArtifact;
+    invocationMeta?: RouteInvocationMeta;
+  }): JsonRecord {
+    const initUrl = invocationMeta?.originalUrl
+      ? new URL(invocationMeta.originalUrl)
+      : requestUrl;
+    const extractedParams =
+      normalizeRouteParams(routeOutput.pathname, invocationMeta?.routeMatches) ??
+      extractRouteParamsFromPathname(routeOutput.pathname, requestUrl.pathname);
+
+    return {
+      relativeProjectDir,
+      distDir: runtimeDistDir,
+      initURL: initUrl.toString(),
+      initProtocol: initUrl.protocol.slice(0, -1),
+      initQuery: searchParamsToQueryObject(initUrl.searchParams),
+      query: searchParamsToQueryObject(requestUrl.searchParams),
+      ...(extractedParams ? { params: extractedParams } : {}),
+      ...(req.headers[routeGraph.rsc.header] === '1'
+        ? { isRSCRequest: true }
+        : {}),
+      ...(req.headers[routeGraph.rsc.prefetchHeader] === '1'
+        ? { isPrefetchRSCRequest: true }
+        : {}),
+      ...(requestUrl.pathname.includes('/_next/data/')
+        ? { isNextDataReq: true }
+        : {}),
+      ...(!routeOutput.pathname.includes('[') &&
+      routeOutput.pathname !== requestUrl.pathname
+        ? { rewrittenPathname: routeOutput.pathname }
+        : {}),
+      ...(invocationMeta?.resolvedPathname &&
+      invocationMeta.resolvedPathname !== routeOutput.pathname
+        ? { resolvedPathname: invocationMeta.resolvedPathname }
+        : {}),
+      minimalMode: false,
+    };
+  }
+
+  async function invokeNodeRouteOutput({
+    req,
+    res,
+    routeOutput,
+    invocationMeta,
+  }: {
+    req: http.IncomingMessage;
+    res: http.ServerResponse;
+    routeOutput: BunRouteArtifact;
+    invocationMeta?: RouteInvocationMeta;
+  }): Promise<void> {
+    const handler = await getNodeRouteHandler(routeOutput);
+    const requestUrl = getNodeRequestUrl(req);
+    const requestMeta = buildNodeRequestMeta({
+      req,
+      requestUrl,
+      routeOutput,
+      invocationMeta,
+    });
+
+    const maybeResult = await handler(req, res, {
+      waitUntil: (promise) => {
+        promise.catch((error) => {
+          console.error('[adapter-bun] node waitUntil errored:', error);
+        });
+      },
+      requestMeta,
+    });
+
+    if (
+      maybeResult !== undefined &&
+      maybeResult !== null &&
+      !res.headersSent &&
+      !res.writableEnded
+    ) {
+      await writeResponseToNode(res, await toResponse(maybeResult));
+    }
+  }
+
+  function writePlainTextStatusResponse(
+    res: http.ServerResponse,
+    statusCode: number,
+    body: string
+  ): void {
+    if (!res.headersSent) {
+      res.statusCode = statusCode;
+      res.setHeader('content-type', 'text/plain; charset=utf-8');
+    }
+    if (!res.writableEnded) {
+      res.end(body);
+    }
+  }
+
+  async function renderNodeStatusOutput({
+    req,
+    res,
+    statusCode,
+    invocationMeta,
+    currentOutputPathname,
+  }: {
+    req: http.IncomingMessage;
+    res: http.ServerResponse;
+    statusCode: 404 | 500;
+    invocationMeta?: RouteInvocationMeta;
+    currentOutputPathname?: string;
+  }): Promise<boolean> {
+    const routeOutput =
+      statusCode === 404 ? notFoundRouteOutput : serverErrorRouteOutput;
+
+    if (
+      !routeOutput ||
+      routeOutput.runtime !== 'nodejs' ||
+      routeOutput.pathname === currentOutputPathname
+    ) {
+      return false;
+    }
+
+    try {
+      if (!res.headersSent) {
+        res.statusCode = statusCode;
+      }
+      await invokeNodeRouteOutput({
+        req,
+        res,
+        routeOutput,
+        invocationMeta,
+      });
+      return true;
+    } catch (error) {
+      console.error(
+        `[adapter-bun] failed to render ${statusCode} fallback output "${routeOutput.pathname}":`,
+        error
+      );
+      return false;
+    }
+  }
+
+  const routerServerMethodsSymbol = Symbol.for('@next/router-server-methods');
+  const routerServerContext =
+    globalThis as typeof globalThis & {
+      [key: symbol]: Record<
+        string,
+        {
+          render404?: (
+            req: http.IncomingMessage,
+            res: http.ServerResponse
+          ) => Promise<void>;
+        }
+      >;
+    };
+  routerServerContext[routerServerMethodsSymbol] ??= {};
+  routerServerContext[routerServerMethodsSymbol]['.'] = {
+    async render404(req, res): Promise<void> {
+      const rendered = await renderNodeStatusOutput({
+        req,
+        res,
+        statusCode: 404,
+      });
+      if (!rendered) {
+        writePlainTextStatusResponse(res, 404, 'This page could not be found');
+      }
+    },
+  };
+
   const backendServer = http.createServer(async (req, res) => {
     req.headers = { ...req.headers };
     patchCacheControlHeader(req, res);
@@ -2026,122 +2313,56 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       }
     }
 
+    let internalOutputPathname: string | undefined;
+    let invocationMeta: RouteInvocationMeta | undefined;
+
     try {
-      const internalOutputPathname = getSingleHeaderValue(
+      const resolvedInternalOutputPathname = getSingleHeaderValue(
         req.headers['x-bun-output-pathname']
       );
       if (
-        typeof internalOutputPathname !== 'string' ||
-        internalOutputPathname.length === 0
+        typeof resolvedInternalOutputPathname !== 'string' ||
+        resolvedInternalOutputPathname.length === 0
       ) {
-        if (!res.headersSent) {
-          res.statusCode = 404;
-          res.setHeader('content-type', 'text/plain; charset=utf-8');
-        }
-        res.end('This page could not be found');
+        writePlainTextStatusResponse(res, 404, 'This page could not be found');
         return;
       }
 
       delete req.headers['x-bun-output-pathname'];
-      const routeOutput = routeOutputsByPathname.get(internalOutputPathname);
+      // Preserve for fallback handling in outer error paths.
+      internalOutputPathname = resolvedInternalOutputPathname;
+      const routeOutput = routeOutputsByPathname.get(
+        resolvedInternalOutputPathname
+      );
       if (!routeOutput || routeOutput.runtime === 'edge') {
         throw new Error(
-          `[adapter-bun] missing node route output for "${internalOutputPathname}"`
+          `[adapter-bun] missing node route output for "${resolvedInternalOutputPathname}"`
         );
       }
 
-      const invocationMeta = decodeRouteInvocationMeta(
+      invocationMeta = decodeRouteInvocationMeta(
         getSingleHeaderValue(req.headers['x-bun-invoke-meta'])
       );
       delete req.headers['x-bun-invoke-meta'];
 
-      const handler = await getNodeRouteHandler(routeOutput);
-      const requestUrl = new URL(
-        req.url || '/',
-        `${getSingleHeaderValue(req.headers['x-forwarded-proto']) || 'http'}://${getSingleHeaderValue(req.headers.host) || appHostname}`
-      );
-      const initUrl = invocationMeta?.originalUrl
-        ? new URL(invocationMeta.originalUrl)
-        : requestUrl;
-      const extractedParams =
-        normalizeRouteParams(routeOutput.pathname, invocationMeta?.routeMatches) ??
-        extractRouteParamsFromPathname(routeOutput.pathname, requestUrl.pathname);
-
-      const requestMeta: JsonRecord = {
-        relativeProjectDir,
-        distDir: runtimeDistDir,
-        initURL: initUrl.toString(),
-        initProtocol: initUrl.protocol.slice(0, -1),
-        initQuery: searchParamsToQueryObject(initUrl.searchParams),
-        query: searchParamsToQueryObject(requestUrl.searchParams),
-        ...(extractedParams ? { params: extractedParams } : {}),
-        ...(req.headers[routeGraph.rsc.header] === '1'
-          ? { isRSCRequest: true }
-          : {}),
-        ...(req.headers[routeGraph.rsc.prefetchHeader] === '1'
-          ? { isPrefetchRSCRequest: true }
-          : {}),
-        ...(requestUrl.pathname.includes('/_next/data/')
-          ? { isNextDataReq: true }
-          : {}),
-        ...(!routeOutput.pathname.includes('[') &&
-        routeOutput.pathname !== requestUrl.pathname
-          ? { rewrittenPathname: routeOutput.pathname }
-          : {}),
-        ...(invocationMeta?.resolvedPathname &&
-        invocationMeta.resolvedPathname !== routeOutput.pathname
-          ? { resolvedPathname: invocationMeta.resolvedPathname }
-          : {}),
-        minimalMode: false,
-      };
-
       await prepareActionRequestBodyForBun(req);
-      try {
-        const maybeResult = await handler(req, res, {
-          waitUntil: (promise) => {
-            promise.catch((error) => {
-              console.error('[adapter-bun] node waitUntil errored:', error);
-            });
-          },
-          requestMeta,
-        });
-
-        if (
-          maybeResult !== undefined &&
-          maybeResult !== null &&
-          !res.headersSent &&
-          !res.writableEnded
-        ) {
-          await writeResponseToNode(res, await toResponse(maybeResult));
-        }
-      } catch (error) {
-        if (isNoFallbackLikeError(error)) {
-          if (!res.headersSent) {
-            res.statusCode = 404;
-            res.setHeader('content-type', 'text/plain; charset=utf-8');
-            res.end('This page could not be found');
-            return;
-          }
-        }
-        throw error;
-      }
+      await invokeNodeRouteOutput({
+        req,
+        res,
+        routeOutput,
+        invocationMeta,
+      });
     } catch (error) {
-      if (isNoFallbackLikeError(error)) {
-        if (!res.headersSent) {
-          res.statusCode = 404;
-          res.setHeader('content-type', 'text/plain; charset=utf-8');
-          res.end('This page could not be found');
-        }
-        return;
-      }
-
       console.error('[adapter-bun] error handling node request:', error);
-      if (!res.headersSent) {
-        res.statusCode = 500;
-        res.setHeader('content-type', 'text/plain; charset=utf-8');
-      }
-      if (!res.writableEnded) {
-        res.end('Internal Server Error');
+      const rendered500 = await renderNodeStatusOutput({
+        req,
+        res,
+        statusCode: 500,
+        invocationMeta,
+        currentOutputPathname: internalOutputPathname,
+      });
+      if (!rendered500) {
+        writePlainTextStatusResponse(res, 500, 'Internal Server Error');
       }
     }
   });
@@ -2351,6 +2572,16 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         );
       }
 
+      const upstreamRequestUrl = new URL(request.url);
+      const literalStatusOverride = getLiteralStatusOverride({
+        requestPathname: upstreamRequestUrl.pathname,
+        basePath: manifest.build.basePath,
+        i18n: manifest.build.i18n,
+        hasPrerenderRevalidateHeader: request.headers.has(
+          'x-prerender-revalidate'
+        ),
+      });
+
       const resolvedResolutionPathname = resolveResolutionPathname(resolution);
       const requestedResolutionPathname = normalizeIndexPathnameAlias(
         resolvedResolutionPathname,
@@ -2407,13 +2638,23 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           matchedStaticAsset,
           routeGraph
         );
+        const staticAssetResolution =
+          literalStatusOverride !== null
+            ? ({
+                ...resolution,
+                status: literalStatusOverride,
+              } satisfies ResolveRoutesResult)
+            : resolution;
         return sanitizeProxyResponse(
-          applyResolutionToResponse(response, resolution),
+          applyResolutionToResponse(
+            response,
+            staticAssetResolution,
+            literalStatusOverride ?? undefined
+          ),
           request
         );
       }
 
-      const upstreamRequestUrl = new URL(request.url);
       const prerenderArtifact = normalizedEffectiveMatchedPathname
         ? prerenderArtifactsByPathname.get(normalizedEffectiveMatchedPathname)
         : undefined;
@@ -2449,7 +2690,8 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       ) {
         routeOutput = findDynamicOutputForPathname(
           manifest.routeOutputs,
-          normalizedEffectiveMatchedPathname
+          normalizedEffectiveMatchedPathname,
+          prerenderFallbackFalseByPathname
         );
       }
 
@@ -2460,7 +2702,8 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       ) {
         routeOutput = findDynamicOutputForPathname(
           manifest.routeOutputs,
-          requestedResolutionPathname
+          requestedResolutionPathname,
+          prerenderFallbackFalseByPathname
         );
       }
 
@@ -2499,7 +2742,8 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
             (canUseDynamicRouteFallback
               ? findDynamicOutputForPathname(
                   manifest.routeOutputs,
-                  invocationAliasPathname
+                  invocationAliasPathname,
+                  prerenderFallbackFalseByPathname
                 )
               : undefined);
         }
@@ -2525,8 +2769,19 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
             invocationStaticAsset,
             routeGraph
           );
+          const staticAssetResolution =
+            literalStatusOverride !== null
+              ? ({
+                  ...resolution,
+                  status: literalStatusOverride,
+                } satisfies ResolveRoutesResult)
+              : resolution;
           return sanitizeProxyResponse(
-            applyResolutionToResponse(response, resolution),
+            applyResolutionToResponse(
+              response,
+              staticAssetResolution,
+              literalStatusOverride ?? undefined
+            ),
             request
           );
         }
@@ -2535,16 +2790,26 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       const invocationSourceHeaders = middlewareRequestHeaders
         ? new Headers(middlewareRequestHeaders)
         : new Headers(request.headers);
+      const isErrorFallback =
+        !routeOutput &&
+        literalStatusOverride === 500 &&
+        typeof serverErrorRouteOutput !== 'undefined';
+      if (!routeOutput && literalStatusOverride === 500 && serverErrorRouteOutput) {
+        routeOutput = serverErrorRouteOutput;
+      }
       const isNotFoundFallback =
         !routeOutput && typeof notFoundRouteOutput !== 'undefined';
       if (!routeOutput && notFoundRouteOutput) {
         routeOutput = notFoundRouteOutput;
       }
+      const fallbackStatusOverride =
+        literalStatusOverride ??
+        (isErrorFallback ? 500 : isNotFoundFallback ? 404 : null);
       const invocationResolution =
-        isNotFoundFallback && (resolution.status ?? 200) < 400
+        fallbackStatusOverride !== null
           ? ({
               ...resolution,
-              status: 404,
+              status: fallbackStatusOverride,
             } satisfies ResolveRoutesResult)
           : resolution;
 
@@ -2584,6 +2849,8 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
             outputId: routeOutput.id,
             source: isNotFoundFallback
               ? 'not-found'
+              : isErrorFallback
+                ? 'error'
               : prerenderArtifact
                 ? 'prerender-parent'
                 : 'function',
@@ -2661,7 +2928,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       }
 
       const notFoundResponse = new Response('This page could not be found', {
-        status: resolution.status ?? 404,
+        status: fallbackStatusOverride ?? resolution.status ?? 404,
         headers: {
           'content-type': 'text/plain; charset=utf-8',
         },
@@ -2669,8 +2936,8 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       return sanitizeProxyResponse(
         applyResolutionToResponse(
           notFoundResponse,
-          resolution,
-          resolution.status ?? 404
+          invocationResolution,
+          fallbackStatusOverride ?? resolution.status ?? 404
         ),
         request
       );
