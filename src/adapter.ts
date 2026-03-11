@@ -143,6 +143,7 @@ function serializeMiddlewareOutput(
     runtime: middlewareOutput.runtime,
     filePath: toPosixRelativePath(distDirPath, middlewareOutput.filePath),
     env: middlewareOutput.config.env ?? undefined,
+    matchers: middlewareOutput.config.matchers ?? undefined,
   };
 
   if (middlewareOutput.runtime === 'edge') {
@@ -417,8 +418,8 @@ async function seedPrerenderCache({
     const insertEntry = db.query(
       `INSERT OR REPLACE INTO prerender_entries
        (cache_key, pathname, group_id, status, headers, body, body_encoding,
-        created_at, revalidate_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        created_at, revalidate_at, expires_at, postponed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertTarget = db.query(
       `INSERT OR REPLACE INTO revalidate_targets (cache_key, pathname, group_id, tags)
@@ -440,6 +441,7 @@ async function seedPrerenderCache({
       tags: string[];
       revalidateAt: number | null;
       expiresAt: number | null;
+      postponed: string | null;
     }> = [];
 
     for (const prerender of seedable) {
@@ -478,6 +480,10 @@ async function seedPrerenderCache({
         tags,
         revalidateAt,
         expiresAt,
+        postponed:
+          typeof fallback.postponedState === 'string'
+            ? fallback.postponedState
+            : null,
       });
     }
 
@@ -493,7 +499,8 @@ async function seedPrerenderCache({
           'binary',
           createdAt,
           entry.revalidateAt,
-          entry.expiresAt
+          entry.expiresAt,
+          entry.postponed
         );
 
         insertTarget.run(

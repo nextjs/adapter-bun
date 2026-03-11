@@ -13,6 +13,7 @@ export interface PrerenderCacheEntry {
   createdAt: number;
   revalidateAt: number | null;
   expiresAt: number | null;
+  postponed?: string;
   cacheQuery?: Record<string, string[]>;
   cacheHeaders?: Record<string, string>;
 }

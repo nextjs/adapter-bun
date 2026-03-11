@@ -48,3 +48,10 @@ if [ -f "$LOG_FILE" ]; then
     echo ""
   fi
 fi
+
+# Persist the generated deployment manifest for post-run debugging.
+MANIFEST_FILE="bun-dist/deployment-manifest.json"
+if [ -f "$MANIFEST_FILE" ]; then
+  PERSIST_MANIFEST_PATH="${ADAPTER_BUN_PERSIST_MANIFEST:-/tmp/adapter-bun-last-deployment-manifest.json}"
+  cp "$MANIFEST_FILE" "$PERSIST_MANIFEST_PATH" 2>/dev/null || true
+fi

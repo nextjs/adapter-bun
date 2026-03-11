@@ -7,6 +7,15 @@ import type {
   BunStaticAsset,
   BuildCompleteContext,
 } from './types.ts';
+import { getSortedRoutes } from 'next/dist/shared/lib/router/utils/sorted-routes.js';
+
+function sortPathnames(pathnames: string[]): string[] {
+  try {
+    return getSortedRoutes(pathnames);
+  } catch {
+    return [...pathnames].sort((a, b) => a.localeCompare(b));
+  }
+}
 
 export function collectOutputPathnames(
   outputs: BuildCompleteContext['outputs']
@@ -32,7 +41,7 @@ export function collectOutputPathnames(
     pathnames.add('/');
   }
 
-  return [...pathnames].sort((a, b) => a.localeCompare(b));
+  return sortPathnames([...pathnames]);
 }
 
 export function collectPrerenderedPathnames(
@@ -44,7 +53,7 @@ export function collectPrerenderedPathnames(
     pathnames.add(output.pathname);
   }
 
-  return [...pathnames].sort((a, b) => a.localeCompare(b));
+  return sortPathnames([...pathnames]);
 }
 
 export function buildDeploymentManifest({

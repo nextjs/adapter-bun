@@ -129,11 +129,18 @@ type RouteInvocationMeta = {
   originalUrl: string;
   resolvedPathname?: string;
   routeMatches?: Record<string, string>;
+  source?: 'not-found' | 'error';
 };
 type EdgeGlobalCacheHandlers = {
   FetchCache?: unknown;
   DefaultCache?: unknown;
   RemoteCache?: unknown;
+};
+type MiddlewareMatcher = NonNullable<BunMiddlewareArtifact['matchers']>[number];
+type MiddlewareMatcherCondition = {
+  type: 'header' | 'query' | 'cookie' | 'host';
+  key: string;
+  value?: string;
 };
 
 const EDGE_NATIVE_MODULES = new Map<string, unknown>([
@@ -148,6 +155,9 @@ const EDGE_NATIVE_MODULES = new Map<string, unknown>([
   ['util', UtilImplementation],
   ['node:util', UtilImplementation],
 ]);
+const NEXT_ROUTER_STATE_TREE_HEADER = 'next-router-state-tree';
+const NEXT_URL_HEADER = 'next-url';
+const NEXT_RSC_UNION_QUERY = '_rsc';
 
 interface StartServerOptions {
   adapterDir?: string;
@@ -216,6 +226,15 @@ function toResolutionI18nConfig(
   } as never;
 }
 
+function isI18nRootPathname(pathname: string, basePath: string): boolean {
+  const normalizedBasePath =
+    basePath && basePath !== '/' ? (basePath.endsWith('/') ? basePath.slice(0, -1) : basePath) : '';
+  if (normalizedBasePath.length > 0) {
+    return pathname === normalizedBasePath || pathname === `${normalizedBasePath}/`;
+  }
+  return pathname === '/';
+}
+
 function stripMiddlewareResponse(result: JsonRecord): JsonRecord {
   if (!('response' in result)) {
     return result;
@@ -243,6 +262,9 @@ function applyResolutionToResponse(
       if (normalizedKey === 'cache-control' && headers.has('cache-control')) {
         continue;
       }
+      if (headers.has(key)) {
+        continue;
+      }
       headers.set(key, value);
     }
   }
@@ -252,6 +274,38 @@ function applyResolutionToResponse(
     statusText: response.statusText,
     headers,
   });
+}
+
+function resolveRedirectLocationWithPreservedSearch({
+  location,
+  requestUrl,
+}: {
+  location: string;
+  requestUrl: URL;
+}): string {
+  if (requestUrl.search.length === 0 || location.length === 0) {
+    return location;
+  }
+
+  let redirectedUrl: URL;
+  try {
+    redirectedUrl = new URL(location, requestUrl.origin);
+  } catch {
+    return location;
+  }
+
+  if (
+    redirectedUrl.origin !== requestUrl.origin ||
+    redirectedUrl.search.length > 0
+  ) {
+    return location;
+  }
+
+  redirectedUrl.search = requestUrl.search;
+  if (location.startsWith('/')) {
+    return `${redirectedUrl.pathname}${redirectedUrl.search}${redirectedUrl.hash}`;
+  }
+  return redirectedUrl.toString();
 }
 
 function isRedirectResolution(resolution: ResolveRoutesResult): boolean {
@@ -313,8 +367,23 @@ function resolveEdgeArtifactModulePaths(
 ): string[] {
   const seen = new Set<string>();
   const modulePaths: string[] = [];
-  const pushPath = (moduleRelativePath: string | undefined): void => {
+  const isEdgeRuntimeModuleSource = (value: string): boolean => {
+    const pathname = value.split('?')[0] ?? value;
+    const ext = path.extname(pathname).toLowerCase();
+    return ext === '.js' || ext === '.mjs' || ext === '.cjs';
+  };
+
+  const pushPath = ({
+    moduleRelativePath,
+    force,
+  }: {
+    moduleRelativePath: string | undefined;
+    force?: boolean;
+  }): void => {
     if (!moduleRelativePath || moduleRelativePath.length === 0) {
+      return;
+    }
+    if (!force && !isEdgeRuntimeModuleSource(moduleRelativePath)) {
       return;
     }
     const absolutePath = path.isAbsolute(moduleRelativePath)
@@ -336,12 +405,15 @@ function resolveEdgeArtifactModulePaths(
   );
 
   for (const moduleRelativePath of nonWrapperAssetPaths) {
-    pushPath(moduleRelativePath);
+    pushPath({ moduleRelativePath });
   }
   for (const moduleRelativePath of wrapperAssetPaths) {
-    pushPath(moduleRelativePath);
+    pushPath({ moduleRelativePath });
   }
-  pushPath(artifact.filePath);
+  pushPath({
+    moduleRelativePath: artifact.filePath,
+    force: true,
+  });
 
   return modulePaths;
 }
@@ -549,14 +621,13 @@ function normalizeIndexPathnameAlias(
     return pathname;
   }
 
-  const hasRootPathname =
-    routeOutputsByPathname.has('/') ||
-    staticAssetsByPathname.has('/') ||
-    prerenderArtifactsByPathname.has('/');
-  const hasIndexPathname =
-    routeOutputsByPathname.has('/index') ||
-    staticAssetsByPathname.has('/index') ||
-    prerenderArtifactsByPathname.has('/index');
+  const hasPathname = (candidate: string): boolean =>
+    routeOutputsByPathname.has(candidate) ||
+    staticAssetsByPathname.has(candidate) ||
+    prerenderArtifactsByPathname.has(candidate);
+
+  const hasRootPathname = hasPathname('/');
+  const hasIndexPathname = hasPathname('/index');
 
   if (pathname === '/index' && hasRootPathname) {
     return '/';
@@ -564,6 +635,50 @@ function normalizeIndexPathnameAlias(
 
   if (pathname === '/' && !hasRootPathname && hasIndexPathname) {
     return '/index';
+  }
+
+  if (pathname !== '/' && pathname.endsWith('/')) {
+    const withoutTrailingSlash = pathname.slice(0, -1);
+    if (!hasPathname(pathname) && hasPathname(withoutTrailingSlash)) {
+      const prefersNestedIndexForPrerender =
+        staticAssetsByPathname.get(withoutTrailingSlash)?.sourceType ===
+          'prerender' &&
+        routeOutputsByPathname.has(`${withoutTrailingSlash}/index`);
+      if (!prefersNestedIndexForPrerender) {
+        return withoutTrailingSlash;
+      }
+    }
+  } else if (pathname !== '/') {
+    const withTrailingSlash = `${pathname}/`;
+    if (!hasPathname(pathname) && hasPathname(withTrailingSlash)) {
+      return withTrailingSlash;
+    }
+  }
+
+  if (pathname !== '/' && pathname.endsWith('/index')) {
+    const withoutIndex = pathname.slice(0, -'/index'.length) || '/';
+    if (hasPathname(withoutIndex)) {
+      return withoutIndex;
+    }
+  }
+
+  if (
+    pathname !== '/' &&
+    !pathname.endsWith('/index') &&
+    (!hasPathname(pathname) ||
+      (staticAssetsByPathname.get(pathname)?.sourceType === 'prerender' &&
+        routeOutputsByPathname.has(
+          `${pathname.endsWith('/') ? pathname.slice(0, -1) : pathname}/index`
+        )))
+  ) {
+    const pathnameWithoutTrailingSlash =
+      pathname.endsWith('/') && pathname.length > 1
+        ? pathname.slice(0, -1)
+        : pathname;
+    const withIndex = `${pathnameWithoutTrailingSlash}/index`;
+    if (hasPathname(withIndex)) {
+      return withIndex;
+    }
   }
 
   return pathname;
@@ -599,6 +714,16 @@ function appendQueryObject(
   }
 }
 
+function overwriteQueryObject(
+  searchParams: URLSearchParams,
+  query: QueryObject
+): void {
+  for (const key of Object.keys(query)) {
+    searchParams.delete(key);
+  }
+  appendQueryObject(searchParams, query);
+}
+
 function appendSearchParams(
   target: URLSearchParams,
   source: URLSearchParams
@@ -606,6 +731,20 @@ function appendSearchParams(
   for (const [key, value] of source.entries()) {
     target.append(key, value);
   }
+}
+
+function overwriteSearchParams(
+  target: URLSearchParams,
+  source: URLSearchParams
+): void {
+  const keys = new Set<string>();
+  for (const [key] of source.entries()) {
+    keys.add(key);
+  }
+  for (const key of keys) {
+    target.delete(key);
+  }
+  appendSearchParams(target, source);
 }
 
 function extractRouteGraphDestinationQuery({
@@ -746,6 +885,72 @@ function resolveResolutionPathname(
     : null;
 }
 
+function resolveConcretePathnameFromRouteMatches(
+  pathnameTemplate: string | null,
+  routeMatches?: Record<string, string> | null
+): string | null {
+  if (
+    typeof pathnameTemplate !== 'string' ||
+    pathnameTemplate.length === 0 ||
+    !pathnameTemplate.includes('[')
+  ) {
+    return null;
+  }
+  const normalizedParams = normalizeRouteParams(
+    pathnameTemplate,
+    routeMatches ?? undefined
+  );
+  if (!normalizedParams) {
+    return null;
+  }
+
+  const templateSegments = pathnameTemplate.split('/').filter(Boolean);
+  const concreteSegments: string[] = [];
+
+  for (const templateSegment of templateSegments) {
+    if (
+      templateSegment.startsWith('[[...') &&
+      templateSegment.endsWith(']]')
+    ) {
+      const key = templateSegment.slice('[[...'.length, -']]'.length);
+      const value = normalizedParams[key];
+      if (Array.isArray(value)) {
+        concreteSegments.push(...value);
+      } else if (typeof value === 'string' && value.length > 0) {
+        concreteSegments.push(value);
+      }
+      continue;
+    }
+
+    if (templateSegment.startsWith('[...') && templateSegment.endsWith(']')) {
+      const key = templateSegment.slice('[...'.length, -']'.length);
+      const value = normalizedParams[key];
+      if (Array.isArray(value) && value.length > 0) {
+        concreteSegments.push(...value);
+      } else if (typeof value === 'string' && value.length > 0) {
+        concreteSegments.push(value);
+      } else {
+        return null;
+      }
+      continue;
+    }
+
+    if (templateSegment.startsWith('[') && templateSegment.endsWith(']')) {
+      const key = templateSegment.slice(1, -1);
+      const value = normalizedParams[key];
+      if (typeof value !== 'string' || value.length === 0) {
+        return null;
+      }
+      concreteSegments.push(value);
+      continue;
+    }
+
+    concreteSegments.push(templateSegment);
+  }
+
+  return `/${concreteSegments.join('/')}`;
+}
+
 function resolveInvocationPathname({
   requestPathname,
   matchedPathname,
@@ -760,7 +965,9 @@ function resolveInvocationPathname({
     return requestPathname;
   }
 
-  if (candidate.includes('[')) {
+  // Internal Next.js dynamic segment syntax should not be used as the
+  // invocation pathname.
+  if (candidate.includes('[') || hasInterceptionMarker(candidate)) {
     return requestPathname;
   }
 
@@ -769,6 +976,14 @@ function resolveInvocationPathname({
   }
 
   return candidate;
+}
+
+function hasInterceptionMarker(pathname: string): boolean {
+  return (
+    pathname.includes('/(.)') ||
+    pathname.includes('/(..)') ||
+    pathname.includes('/(...)')
+  );
 }
 
 function normalizeRouteParams(
@@ -788,20 +1003,185 @@ function normalizeRouteParams(
   }
 
   for (const [rawKey, value] of namedEntries) {
-    const key = rawKey.startsWith('nxtP') ? rawKey.slice('nxtP'.length) : rawKey;
+    const key = normalizeRouteMatchKey(rawKey);
+    const normalizedValue = normalizeRouteMatchValue(value);
     const catchAllPattern = `[...${key}]`;
     const optionalCatchAllPattern = `[[...${key}]]`;
+    const segmentPattern = `[${key}]`;
     if (
       pathnameTemplate.includes(optionalCatchAllPattern) ||
       pathnameTemplate.includes(catchAllPattern)
     ) {
-      normalized[key] = value.length > 0 ? value.split('/') : [];
-    } else {
-      normalized[key] = value;
+      normalized[key] =
+        normalizedValue.length > 0 ? normalizedValue.split('/') : [];
+    } else if (pathnameTemplate.includes(segmentPattern)) {
+      normalized[key] = normalizedValue;
     }
   }
 
   return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+function normalizeRouteMatchKey(rawKey: string): string {
+  if (rawKey.startsWith('nxtP') || rawKey.startsWith('nxtI')) {
+    return rawKey.slice(4);
+  }
+  return rawKey;
+}
+
+function normalizeRouteMatchValue(rawValue: string): string {
+  let value = rawValue;
+  while (/^\((?:\.\.\.|\.\.|\.)\)/.test(value)) {
+    value = value.replace(/^\((?:\.\.\.|\.\.|\.)\)/, '');
+  }
+  return value;
+}
+
+function normalizeResolutionRouteMatches(
+  routeMatches?: Record<string, string> | null
+): Record<string, string> | null {
+  if (!routeMatches) {
+    return null;
+  }
+
+  const normalized: Record<string, string> = {};
+  for (const [rawKey, value] of Object.entries(routeMatches)) {
+    if (typeof value !== 'string' || /^\d+$/.test(rawKey)) {
+      continue;
+    }
+    const key = normalizeRouteMatchKey(rawKey);
+    normalized[key] = normalizeRouteMatchValue(value);
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+function routeMatchesToQueryObject(
+  routeMatches?: Record<string, string> | null
+): QueryObject {
+  const query: QueryObject = {};
+  if (!routeMatches) {
+    return query;
+  }
+
+  for (const [rawKey, value] of Object.entries(routeMatches)) {
+    if (typeof value !== 'string' || /^\d+$/.test(rawKey)) {
+      continue;
+    }
+    const normalizedValue = normalizeRouteMatchValue(value);
+    query[rawKey] = normalizedValue;
+    const normalizedKey = normalizeRouteMatchKey(rawKey);
+    if (!Object.prototype.hasOwnProperty.call(query, normalizedKey)) {
+      query[normalizedKey] = normalizedValue;
+    }
+  }
+
+  return query;
+}
+
+function computeDjb2Hash(input: string): number {
+  let hash = 5381;
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) + hash + input.charCodeAt(i)) & 0xffffffff;
+  }
+  return hash >>> 0;
+}
+
+function computeHexHash(input: string): string {
+  return computeDjb2Hash(input).toString(36).slice(0, 5);
+}
+
+function computeCacheBustingSearchParam(
+  prefetchHeader: '1' | '2' | undefined,
+  segmentPrefetchHeader: string | undefined,
+  stateTreeHeader: string | undefined,
+  nextUrlHeader: string | undefined
+): string {
+  if (
+    prefetchHeader === undefined &&
+    segmentPrefetchHeader === undefined &&
+    stateTreeHeader === undefined &&
+    nextUrlHeader === undefined
+  ) {
+    return '';
+  }
+
+  return computeHexHash(
+    [
+      prefetchHeader ?? '0',
+      segmentPrefetchHeader ?? '0',
+      stateTreeHeader ?? '0',
+      nextUrlHeader ?? '0',
+    ].join(',')
+  );
+}
+
+function setCacheBustingSearchParamWithHash(url: URL, hash: string): void {
+  const rawQuery = url.search.startsWith('?')
+    ? url.search.slice(1)
+    : url.search;
+
+  const pairs = rawQuery
+    .split('&')
+    .filter(
+      (pair) => pair.length > 0 && !pair.startsWith(`${NEXT_RSC_UNION_QUERY}=`)
+    );
+
+  if (hash.length > 0) {
+    pairs.push(`${NEXT_RSC_UNION_QUERY}=${hash}`);
+  } else {
+    pairs.push(NEXT_RSC_UNION_QUERY);
+  }
+
+  url.search = pairs.length > 0 ? `?${pairs.join('&')}` : '';
+}
+
+function resolveRscValidationRedirectLocation({
+  request,
+  routeGraph,
+  validateRSCRequestHeaders,
+}: {
+  request: Request;
+  routeGraph: BunDeploymentManifest['routeGraph'];
+  validateRSCRequestHeaders: boolean;
+}): string | null {
+  if (!validateRSCRequestHeaders) {
+    return null;
+  }
+
+  if (request.headers.get(routeGraph.rsc.header) !== '1') {
+    return null;
+  }
+
+  const requestUrl = new URL(request.url);
+  if (requestUrl.pathname === '/404') {
+    return null;
+  }
+
+  const prefetchHeaderValue = request.headers.get(routeGraph.rsc.prefetchHeader);
+  const prefetchHeader =
+    prefetchHeaderValue === '1' || prefetchHeaderValue === '2'
+      ? prefetchHeaderValue
+      : undefined;
+  const segmentPrefetchHeader =
+    request.headers.get(routeGraph.rsc.prefetchSegmentHeader) ?? undefined;
+  const stateTreeHeader =
+    request.headers.get(NEXT_ROUTER_STATE_TREE_HEADER) ?? undefined;
+  const nextUrlHeader = request.headers.get(NEXT_URL_HEADER) ?? undefined;
+  const expectedHash = computeCacheBustingSearchParam(
+    prefetchHeader,
+    segmentPrefetchHeader,
+    stateTreeHeader,
+    nextUrlHeader
+  );
+  const actualHash = requestUrl.searchParams.get(NEXT_RSC_UNION_QUERY);
+
+  if (expectedHash === actualHash) {
+    return null;
+  }
+
+  setCacheBustingSearchParamWithHash(requestUrl, expectedHash);
+  return `${requestUrl.pathname}${requestUrl.search}`;
 }
 
 function resolutionRouteMatchesFromMeta(
@@ -885,6 +1265,22 @@ function extractRouteParamsFromPathname(
   }
 
   return Object.keys(params).length > 0 ? params : undefined;
+}
+
+function mergeRouteParams(
+  pathnameParams?: Record<string, string | string[]>,
+  routeMatchParams?: Record<string, string | string[]>
+): Record<string, string | string[]> | undefined {
+  if (!pathnameParams) {
+    return routeMatchParams;
+  }
+  if (!routeMatchParams) {
+    return pathnameParams;
+  }
+  return {
+    ...pathnameParams,
+    ...routeMatchParams,
+  };
 }
 
 function getSingleHeaderValue(
@@ -1644,11 +2040,192 @@ function resolveNodeHandlerExport(module: Record<string, unknown>): NodeRouteHan
   );
 }
 
+function resolveNodeMiddlewareHandlerExport(
+  module: Record<string, unknown>
+): EdgeRouteHandler {
+  if (typeof module.handler === 'function') {
+    return module.handler as EdgeRouteHandler;
+  }
+  if (typeof module.middleware === 'function') {
+    return module.middleware as EdgeRouteHandler;
+  }
+  if (typeof module.proxy === 'function') {
+    return module.proxy as EdgeRouteHandler;
+  }
+
+  const defaultExport = module.default;
+  if (defaultExport && typeof defaultExport === 'object') {
+    const nested = defaultExport as Record<string, unknown>;
+    if (typeof nested.handler === 'function') {
+      return nested.handler as EdgeRouteHandler;
+    }
+    if (typeof nested.middleware === 'function') {
+      return nested.middleware as EdgeRouteHandler;
+    }
+    if (typeof nested.proxy === 'function') {
+      return nested.proxy as EdgeRouteHandler;
+    }
+  }
+
+  throw new Error(
+    '[adapter-bun] middleware module does not export a supported handler function'
+  );
+}
+
+function parseCookieHeader(headerValue: string | null): Map<string, string> {
+  const cookies = new Map<string, string>();
+  if (!headerValue) {
+    return cookies;
+  }
+  for (const entry of headerValue.split(';')) {
+    const separatorIndex = entry.indexOf('=');
+    if (separatorIndex <= 0) {
+      continue;
+    }
+    const key = entry.slice(0, separatorIndex).trim();
+    if (key.length === 0) {
+      continue;
+    }
+    const value = entry.slice(separatorIndex + 1).trim();
+    cookies.set(key, value);
+  }
+  return cookies;
+}
+
+function getMatcherConditionValue(
+  condition: MiddlewareMatcherCondition,
+  url: URL,
+  headers: Headers
+): string | null {
+  switch (condition.type) {
+    case 'header':
+      return headers.get(condition.key);
+    case 'query':
+      return url.searchParams.get(condition.key);
+    case 'cookie': {
+      const cookies = parseCookieHeader(headers.get('cookie'));
+      return cookies.get(condition.key) ?? null;
+    }
+    case 'host': {
+      const host = headers.get('host');
+      if (!host) {
+        return null;
+      }
+      const portIndex = host.indexOf(':');
+      return portIndex > 0 ? host.slice(0, portIndex) : host;
+    }
+    default:
+      return null;
+  }
+}
+
+function matcherConditionSatisfied(
+  condition: MiddlewareMatcherCondition,
+  url: URL,
+  headers: Headers
+): boolean {
+  const value = getMatcherConditionValue(condition, url, headers);
+  if (value === null) {
+    return false;
+  }
+  if (typeof condition.value !== 'string') {
+    return true;
+  }
+
+  try {
+    return new RegExp(`^${condition.value}$`).test(value);
+  } catch {
+    return value === condition.value;
+  }
+}
+
+function middlewareMatcherMatchesRequest(
+  matcher: MiddlewareMatcher,
+  url: URL,
+  headers: Headers
+): boolean {
+  try {
+    if (!new RegExp(matcher.sourceRegex).test(url.pathname)) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  for (const condition of matcher.has ?? []) {
+    if (
+      !matcherConditionSatisfied(
+        condition as MiddlewareMatcherCondition,
+        url,
+        headers
+      )
+    ) {
+      return false;
+    }
+  }
+
+  for (const condition of matcher.missing ?? []) {
+    if (
+      matcherConditionSatisfied(
+        condition as MiddlewareMatcherCondition,
+        url,
+        headers
+      )
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function shouldInvokeMiddlewareForRequest(
+  middleware: BunMiddlewareArtifact | null | undefined,
+  url: URL,
+  headers: Headers
+): boolean {
+  if (!middleware) {
+    return false;
+  }
+
+  const matchers = middleware.matchers;
+  if (!Array.isArray(matchers) || matchers.length === 0) {
+    return true;
+  }
+
+  return matchers.some((matcher) =>
+    middlewareMatcherMatchesRequest(matcher, url, headers)
+  );
+}
+
 function hasOutputPathname(
   routeOutputsByPathname: Map<string, BunRouteArtifact>,
   pathname: string
 ): boolean {
   return routeOutputsByPathname.has(pathname);
+}
+
+function isAppRouteOutput(output: BunRouteArtifact): boolean {
+  return output.type === 'APP_PAGE' || output.type === 'APP_ROUTE';
+}
+
+function hasLocalePrefix(
+  pathname: string,
+  i18n: BunDeploymentManifest['build']['i18n']
+): boolean {
+  if (!i18n || !Array.isArray(i18n.locales) || i18n.locales.length === 0) {
+    return false;
+  }
+
+  const segments = pathname.split('/');
+  const localeSegment = segments[1];
+  if (!localeSegment) {
+    return false;
+  }
+
+  return i18n.locales.some(
+    (locale) => locale.toLowerCase() === localeSegment.toLowerCase()
+  );
 }
 
 function normalizePathnameForFallbackMatch(pathname: string): string {
@@ -1712,33 +2289,148 @@ function buildPrerenderFallbackFalseByPathname(
   return normalized;
 }
 
-function resolveNotFoundRouteOutput(
-  routeOutputsByPathname: Map<string, BunRouteArtifact>
-): BunRouteArtifact | undefined {
-  return (
-    routeOutputsByPathname.get('/_not-found') ??
-    routeOutputsByPathname.get('/404') ??
-    routeOutputsByPathname.get('/_error')
+function findAppRouteOutputForRequestPathname({
+  requestPathname,
+  routeOutputsByPathname,
+  appRouteOutputs,
+  prerenderFallbackFalseByPathname,
+}: {
+  requestPathname: string;
+  routeOutputsByPathname: Map<string, BunRouteArtifact>;
+  appRouteOutputs: BunRouteArtifact[];
+  prerenderFallbackFalseByPathname?: Map<string, Set<string>>;
+}): BunRouteArtifact | undefined {
+  const normalizedPathname = normalizePathnameForFallbackMatch(requestPathname);
+  const exactAppRouteOutput = routeOutputsByPathname.get(normalizedPathname);
+  if (exactAppRouteOutput && isAppRouteOutput(exactAppRouteOutput)) {
+    return exactAppRouteOutput;
+  }
+
+  return findDynamicOutputForPathname(
+    appRouteOutputs,
+    normalizedPathname,
+    prerenderFallbackFalseByPathname
   );
 }
 
-function resolveServerErrorRouteOutput(
-  routeOutputsByPathname: Map<string, BunRouteArtifact>
+function normalizeBasePathPrefix(basePath: string): string {
+  if (typeof basePath !== 'string' || basePath.length === 0 || basePath === '/') {
+    return '';
+  }
+  return basePath.endsWith('/') ? basePath.slice(0, -1) : basePath;
+}
+
+function withBasePath(pathname: string, basePath: string): string {
+  const normalizedBasePath = normalizeBasePathPrefix(basePath);
+  if (!normalizedBasePath) {
+    return pathname;
+  }
+  if (pathname === '/') {
+    return normalizedBasePath;
+  }
+  return `${normalizedBasePath}${pathname}`;
+}
+
+function getLookupPathnameCandidates(pathname: string, basePath: string): string[] {
+  const prefixedPathname = withBasePath(pathname, basePath);
+  if (prefixedPathname !== pathname) {
+    return [prefixedPathname, pathname];
+  }
+  return [pathname];
+}
+
+function resolveNotFoundRouteOutput(
+  routeOutputsByPathname: Map<string, BunRouteArtifact>,
+  basePath: string
 ): BunRouteArtifact | undefined {
-  return (
-    routeOutputsByPathname.get('/500') ??
-    routeOutputsByPathname.get('/_error')
-  );
+  const candidates = ['/_not-found', '/404'];
+  for (const candidate of candidates) {
+    for (const lookupPathname of getLookupPathnameCandidates(
+      candidate,
+      basePath
+    )) {
+      const routeOutput = routeOutputsByPathname.get(lookupPathname);
+      if (routeOutput) {
+        return routeOutput;
+      }
+    }
+  }
+  return undefined;
+}
+
+function resolveServerErrorRouteOutput(
+  routeOutputsByPathname: Map<string, BunRouteArtifact>,
+  basePath: string
+): BunRouteArtifact | undefined {
+  const candidates = ['/500', '/_error'];
+  for (const candidate of candidates) {
+    for (const lookupPathname of getLookupPathnameCandidates(
+      candidate,
+      basePath
+    )) {
+      const routeOutput = routeOutputsByPathname.get(lookupPathname);
+      if (routeOutput) {
+        return routeOutput;
+      }
+    }
+  }
+  return undefined;
+}
+
+function resolveNotFoundStaticAsset(
+  staticAssetsByPathname: Map<
+    string,
+    BunDeploymentManifest['staticAssets'][number]
+  >,
+  basePath: string
+): BunDeploymentManifest['staticAssets'][number] | undefined {
+  const candidates = ['/_not-found', '/404'];
+  for (const candidate of candidates) {
+    for (const lookupPathname of getLookupPathnameCandidates(
+      candidate,
+      basePath
+    )) {
+      const staticAsset = staticAssetsByPathname.get(lookupPathname);
+      if (staticAsset) {
+        return staticAsset;
+      }
+    }
+  }
+  return undefined;
+}
+
+function pathHasPrefix(pathname: string, prefix: string): boolean {
+  if (typeof pathname !== 'string' || typeof prefix !== 'string') {
+    return false;
+  }
+  if (prefix.length === 0) {
+    return false;
+  }
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
+
+function removePathPrefix(pathname: string, prefix: string): string {
+  if (prefix.length === 0 || prefix === '/' || !pathHasPrefix(pathname, prefix)) {
+    return pathname;
+  }
+  const withoutPrefix = pathname.slice(prefix.length);
+  return withoutPrefix.startsWith('/') ? withoutPrefix : `/${withoutPrefix}`;
 }
 
 function trimBasePath(pathname: string, basePath: string): string {
   const normalizedBasePath =
-    typeof basePath === 'string' && basePath !== '/' ? basePath : '';
-  if (!normalizedBasePath || !pathname.startsWith(normalizedBasePath)) {
+    typeof basePath === 'string' && basePath.length > 0 ? basePath : '';
+  if (!normalizedBasePath) {
     return pathname;
   }
-  const withoutBasePath = pathname.slice(normalizedBasePath.length);
-  return withoutBasePath.length > 0 ? withoutBasePath : '/';
+  return removePathPrefix(pathname, normalizedBasePath);
+}
+
+function trimAssetPrefix(pathname: string, assetPrefix: unknown): string {
+  if (typeof assetPrefix !== 'string' || assetPrefix.length === 0) {
+    return pathname;
+  }
+  return removePathPrefix(pathname, assetPrefix);
 }
 
 function stripLocaleFromPathname(
@@ -1759,6 +2451,24 @@ function stripLocaleFromPathname(
     return withoutLocale.length > 0 ? withoutLocale : '/';
   }
 
+  return pathname;
+}
+
+function getRealRequestPathnameForNotFound({
+  requestPathname,
+  basePath,
+  assetPrefix,
+  i18n,
+}: {
+  requestPathname: string;
+  basePath: string;
+  assetPrefix: unknown;
+  i18n: BunDeploymentManifest['build']['i18n'];
+}): string {
+  let pathname = requestPathname;
+  pathname = trimBasePath(pathname, basePath);
+  pathname = trimAssetPrefix(pathname, assetPrefix);
+  pathname = stripLocaleFromPathname(pathname, i18n);
   return pathname;
 }
 
@@ -1848,6 +2558,14 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
     manifest,
     options?.runtimeNextConfigFile
   );
+  const runtimeExperimentalConfig = toJsonRecord(runtimeNextConfig.experimental);
+  const validateRSCRequestHeaders =
+    runtimeExperimentalConfig.validateRSCRequestHeaders === true;
+  if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1') {
+    console.error('[adapter-bun] runtime config', {
+      validateRSCRequestHeaders,
+    });
+  }
   const runtimeDistDir = path.isAbsolute(runtimeNextConfig.distDir)
     ? runtimeNextConfig.distDir
     : path.join(projectDir, runtimeNextConfig.distDir);
@@ -1859,18 +2577,24 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
   const routeOutputsByPathname = new Map(
     manifest.routeOutputs.map((output) => [output.pathname, output])
   );
+  const appRouteOutputs = manifest.routeOutputs.filter(isAppRouteOutput);
   const prerenderArtifactsByPathname = new Map(
     (manifest.prerenderArtifacts ?? []).map((artifact) => [artifact.pathname, artifact])
   );
   const prerenderFallbackFalseByPathname = buildPrerenderFallbackFalseByPathname(
     manifest.prerenderFallbackFalseMap
   );
+  const middlewareArtifact = manifest.middleware ?? null;
   const staticAssetsByPathname = new Map(
     (manifest.staticAssets ?? []).map((asset) => [asset.pathname, asset])
   );
-  const notFoundRouteOutput = resolveNotFoundRouteOutput(routeOutputsByPathname);
+  const notFoundRouteOutput = resolveNotFoundRouteOutput(
+    routeOutputsByPathname,
+    manifest.build.basePath
+  );
   const serverErrorRouteOutput = resolveServerErrorRouteOutput(
-    routeOutputsByPathname
+    routeOutputsByPathname,
+    manifest.build.basePath
   );
 
   const nodeRouteHandlerCache = new Map<string, Promise<NodeRouteHandler>>();
@@ -2083,33 +2807,58 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
 
     middlewareHandlerPromise = (async () => {
       const middleware = manifest.middleware;
-      if (!middleware || middleware.runtime !== 'edge') {
+      if (!middleware) {
         return null;
       }
 
-      const middlewareModulePaths = resolveEdgeArtifactModulePaths(
-        runtimeDistDir,
-        middleware
-      );
-      if (middlewareModulePaths.length === 0) {
-        return null;
-      }
-      const executor = await getEdgeRuntimeExecutor({
-        cacheKey: `middleware:${normalizeEdgeOutputId(middleware.id)}`,
-        sourcePage: middleware.sourcePage,
-        outputId: middleware.id,
-        modulePaths: middlewareModulePaths,
-        assets: middleware.assets,
-        wasmAssets: middleware.wasmAssets,
-        env: middleware.env,
-      });
-      return (request: Request, ctx: Parameters<EdgeRouteHandler>[1]) =>
-        invokeEdgeEntryHandler({
-          executor,
-          request,
-          waitUntil: ctx.waitUntil,
-          requestMeta: ctx.requestMeta,
+      if (middleware.runtime === 'edge') {
+        const middlewareModulePaths = resolveEdgeArtifactModulePaths(
+          runtimeDistDir,
+          middleware
+        );
+        if (middlewareModulePaths.length === 0) {
+          return null;
+        }
+        const executor = await getEdgeRuntimeExecutor({
+          cacheKey: `middleware:${normalizeEdgeOutputId(middleware.id)}`,
+          sourcePage: middleware.sourcePage,
+          outputId: middleware.id,
+          modulePaths: middlewareModulePaths,
+          assets: middleware.assets,
+          wasmAssets: middleware.wasmAssets,
+          env: middleware.env,
         });
+        return (request: Request, ctx: Parameters<EdgeRouteHandler>[1]) =>
+          invokeEdgeEntryHandler({
+            executor,
+            request,
+            waitUntil: ctx.waitUntil,
+            requestMeta: ctx.requestMeta,
+          });
+      }
+
+      if (middleware.runtime === 'nodejs') {
+        const modulePath = path.isAbsolute(middleware.filePath)
+          ? middleware.filePath
+          : path.join(runtimeDistDir, middleware.filePath);
+        if (!existsSync(modulePath)) {
+          return null;
+        }
+        const loadedModule = await loadOutputModule(projectRequire, modulePath);
+        const nodeMiddlewareHandler =
+          resolveNodeMiddlewareHandlerExport(loadedModule);
+        return (
+          request: Request,
+          ctx: Parameters<EdgeRouteHandler>[1]
+        ) =>
+          nodeMiddlewareHandler(request, {
+            waitUntil: ctx.waitUntil,
+            signal: request.signal,
+            requestMeta: ctx.requestMeta,
+          });
+      }
+
+      return null;
     })();
 
     return middlewareHandlerPromise;
@@ -2136,9 +2885,10 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
     const initUrl = invocationMeta?.originalUrl
       ? new URL(invocationMeta.originalUrl)
       : requestUrl;
-    const extractedParams =
-      normalizeRouteParams(routeOutput.pathname, invocationMeta?.routeMatches) ??
-      extractRouteParamsFromPathname(routeOutput.pathname, requestUrl.pathname);
+    const extractedParams = mergeRouteParams(
+      extractRouteParamsFromPathname(routeOutput.pathname, requestUrl.pathname),
+      normalizeRouteParams(routeOutput.pathname, invocationMeta?.routeMatches)
+    );
 
     return {
       relativeProjectDir,
@@ -2158,6 +2908,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         ? { isNextDataReq: true }
         : {}),
       ...(!routeOutput.pathname.includes('[') &&
+      !hasInterceptionMarker(routeOutput.pathname) &&
       routeOutput.pathname !== requestUrl.pathname
         ? { rewrittenPathname: routeOutput.pathname }
         : {}),
@@ -2267,20 +3018,60 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
   }
 
   const routerServerMethodsSymbol = Symbol.for('@next/router-server-methods');
+  type RouterServerRevalidateOptions = {
+    unstable_onlyGenerated?: boolean;
+  };
+  type RouterServerRevalidateHeaders = Record<string, string | string[]>;
+  type RouterServerMethods = {
+    revalidate?: (config: {
+      urlPath: string;
+      revalidateHeaders: RouterServerRevalidateHeaders;
+      opts: RouterServerRevalidateOptions;
+    }) => Promise<void>;
+    render404?: (
+      req: http.IncomingMessage,
+      res: http.ServerResponse
+    ) => Promise<void>;
+  };
   const routerServerContext =
     globalThis as typeof globalThis & {
-      [key: symbol]: Record<
-        string,
-        {
-          render404?: (
-            req: http.IncomingMessage,
-            res: http.ServerResponse
-          ) => Promise<void>;
-        }
-      >;
+      [key: symbol]: Record<string, RouterServerMethods>;
     };
   routerServerContext[routerServerMethodsSymbol] ??= {};
-  routerServerContext[routerServerMethodsSymbol]['.'] = {
+  const routerServerMethods: RouterServerMethods = {
+    async revalidate({
+      urlPath,
+      revalidateHeaders,
+      opts,
+    }): Promise<void> {
+      const revalidateUrl = new URL(urlPath, `http://127.0.0.1:${port}`);
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(revalidateHeaders)) {
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            headers.append(key, item);
+          }
+        } else {
+          headers.set(key, value);
+        }
+      }
+
+      const response = await fetch(revalidateUrl, {
+        method: 'HEAD',
+        headers,
+        redirect: 'manual',
+      });
+      const cacheHeader =
+        response.headers.get('x-vercel-cache') ??
+        response.headers.get('x-nextjs-cache');
+      if (
+        cacheHeader?.toUpperCase() !== 'REVALIDATED' &&
+        response.status !== 200 &&
+        !(response.status === 404 && opts.unstable_onlyGenerated)
+      ) {
+        throw new Error(`Invalid response ${response.status}`);
+      }
+    },
     async render404(req, res): Promise<void> {
       const rendered = await renderNodeStatusOutput({
         req,
@@ -2292,6 +3083,11 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       }
     },
   };
+  routerServerContext[routerServerMethodsSymbol][relativeProjectDir] =
+    routerServerMethods;
+  if (relativeProjectDir !== '.') {
+    routerServerContext[routerServerMethodsSymbol]['.'] = routerServerMethods;
+  }
 
   const backendServer = http.createServer(async (req, res) => {
     req.headers = { ...req.headers };
@@ -2345,7 +3141,26 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       );
       delete req.headers['x-bun-invoke-meta'];
 
+      if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1') {
+        console.error('[adapter-bun] node invocation request', {
+          outputPathname: resolvedInternalOutputPathname,
+          url: req.url,
+          rsc: req.headers[routeGraph.rsc.header] ?? null,
+          accept: req.headers.accept ?? null,
+          nextRouterStateTree: req.headers['next-router-state-tree'] ?? null,
+          nextRouterPrefetch: req.headers['next-router-prefetch'] ?? null,
+          nextUrl: req.headers['next-url'] ?? null,
+        });
+      }
+
       await prepareActionRequestBodyForBun(req);
+      if (!res.headersSent) {
+        if (invocationMeta?.source === 'not-found') {
+          res.statusCode = 404;
+        } else if (invocationMeta?.source === 'error') {
+          res.statusCode = 500;
+        }
+      }
       await invokeNodeRouteOutput({
         req,
         res,
@@ -2386,6 +3201,9 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
     backendServer.once('error', handleError);
     backendServer.listen(0, '127.0.0.1', handleListening);
   });
+  if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1') {
+    console.error('[adapter-bun] backend origin', { backendOrigin });
+  }
 
   async function proxyRequest(
     request: Request,
@@ -2415,6 +3233,17 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       redirect: 'manual',
       signal: request.signal,
     });
+
+    if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1') {
+      console.error('[adapter-bun] proxy response', {
+        requestPathname: new URL(request.url).pathname,
+        upstreamPathname: upstreamUrl.pathname,
+        status: response.status,
+        contentType: response.headers.get('content-type'),
+        rscHeader: request.headers.get(routeGraph.rsc.header),
+        outputPathname: extraHeaders?.get('x-bun-output-pathname') ?? null,
+      });
+    }
 
     return sanitizeProxyResponse(
       applyResolutionToResponse(response, resolution),
@@ -2454,6 +3283,23 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
     hostname: listenHostname,
     idleTimeout: 0,
     async fetch(request, bunServer) {
+      const rscValidationRedirectLocation = resolveRscValidationRedirectLocation({
+        request,
+        routeGraph,
+        validateRSCRequestHeaders,
+      });
+      if (rscValidationRedirectLocation) {
+        return sanitizeProxyResponse(
+          new Response(null, {
+            status: 307,
+            headers: {
+              location: rscValidationRedirectLocation,
+            },
+          }),
+          request
+        );
+      }
+
       const requestForResolution = shouldSendRequestBody(request.method)
         ? request.clone()
         : request;
@@ -2461,7 +3307,63 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       let middlewareRewriteUrl: string | null = null;
       let middlewareResponsePayload: Response | null = null;
 
-      const unresolvedResolution = await resolveRoutes({
+      const invokeResolutionMiddleware = async ({
+        url,
+        headers,
+        requestBody,
+      }: {
+        url: URL;
+        headers: Headers;
+        requestBody: ReadableStream<Uint8Array>;
+      }) => {
+        const middlewareHandler = await getMiddlewareHandler();
+        if (!middlewareHandler) {
+          return {};
+        }
+        if (!shouldInvokeMiddlewareForRequest(middlewareArtifact, url, headers)) {
+          return {};
+        }
+
+        const middlewareRequest = new Request(url.toString(), {
+          method: request.method,
+          headers: new Headers(headers),
+          body: shouldSendRequestBody(request.method) ? requestBody : undefined,
+          signal: request.signal,
+          redirect: 'manual',
+        });
+
+        const middlewareResult = await middlewareHandler(middlewareRequest, {
+          waitUntil: (promise) => {
+            promise.catch((error) => {
+              console.error('[adapter-bun] middleware waitUntil errored:', error);
+            });
+          },
+          signal: request.signal,
+          requestMeta: {
+            source: 'middleware',
+            pathname: url.pathname,
+          },
+        });
+
+        const middlewareResponse = await toResponse(middlewareResult);
+        const middlewareResolved = responseToMiddlewareResult(
+          middlewareResponse,
+          new Headers(headers),
+          url
+        );
+        if (middlewareResolved.bodySent) {
+          middlewareResponsePayload = middlewareResponse;
+        }
+        if (middlewareResolved.requestHeaders) {
+          middlewareRequestHeaders = new Headers(middlewareResolved.requestHeaders);
+        }
+        if (middlewareResolved.rewrite) {
+          middlewareRewriteUrl = middlewareResolved.rewrite.toString();
+        }
+        return middlewareResolved;
+      };
+
+      let unresolvedResolution = await resolveRoutes({
         url: new URL(requestForResolution.url),
         buildId: manifest.build.buildId,
         basePath: manifest.build.basePath,
@@ -2470,63 +3372,123 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         pathnames: manifest.pathnames,
         i18n: toResolutionI18nConfig(manifest),
         routes: routeGraph,
-        invokeMiddleware: async ({ url, headers, requestBody }) => {
-          const middlewareHandler = await getMiddlewareHandler();
-          if (!middlewareHandler) {
-            return {};
-          }
-
-          const middlewareRequest = new Request(url.toString(), {
-            method: request.method,
-            headers: new Headers(headers),
-            body: shouldSendRequestBody(request.method) ? requestBody : undefined,
-            signal: request.signal,
-            redirect: 'manual',
-          });
-
-          const middlewareResult = await middlewareHandler(middlewareRequest, {
-            waitUntil: (promise) => {
-              promise.catch((error) => {
-                console.error('[adapter-bun] middleware waitUntil errored:', error);
-              });
-            },
-            signal: request.signal,
-            requestMeta: {
-              source: 'middleware',
-              pathname: url.pathname,
-            },
-          });
-
-          const middlewareResponse = await toResponse(middlewareResult);
-          const middlewareResolved = responseToMiddlewareResult(
-            middlewareResponse,
-            new Headers(headers),
-            url
-          );
-          if (middlewareResolved.bodySent) {
-            middlewareResponsePayload = middlewareResponse;
-          }
-          if (middlewareResolved.requestHeaders) {
-            middlewareRequestHeaders = new Headers(
-              middlewareResolved.requestHeaders
-            );
-          }
-          if (middlewareResolved.rewrite) {
-            middlewareRewriteUrl = middlewareResolved.rewrite.toString();
-          }
-          return middlewareResolved;
-        },
+        invokeMiddleware: invokeResolutionMiddleware,
       });
 
-      const resolution = stripMiddlewareResponse(
+      let resolution = stripMiddlewareResponse(
         unresolvedResolution as unknown as JsonRecord
       ) as ResolveRoutesResult;
 
+      if (
+        !shouldSendRequestBody(request.method) &&
+        middlewareRequestHeaders === null &&
+        middlewareRewriteUrl === null &&
+        middlewareResponsePayload === null &&
+        resolveResolutionPathname(resolution) === null &&
+        !resolution.redirect &&
+        !resolution.externalRewrite &&
+        !resolution.middlewareResponded &&
+        !isRedirectResolution(resolution)
+      ) {
+        const originalUrl = new URL(requestForResolution.url);
+        const fallbackPathnames: string[] = [];
+        const maybePushFallbackPathname = (pathname: string): void => {
+          if (
+            pathname.length === 0 ||
+            pathname === originalUrl.pathname ||
+            fallbackPathnames.includes(pathname)
+          ) {
+            return;
+          }
+          fallbackPathnames.push(pathname);
+        };
+
+        const foldedPathname = originalUrl.pathname.toLowerCase();
+        if (foldedPathname !== originalUrl.pathname) {
+          maybePushFallbackPathname(foldedPathname);
+        }
+
+        for (const fallbackPathname of fallbackPathnames) {
+          const fallbackUrl = new URL(originalUrl);
+          fallbackUrl.pathname = fallbackPathname;
+          const fallbackUnresolvedResolution = await resolveRoutes({
+            url: fallbackUrl,
+            buildId: manifest.build.buildId,
+            basePath: manifest.build.basePath,
+            requestBody: createEmptyBodyStream(),
+            headers: new Headers([...requestForResolution.headers.entries()]),
+            pathnames: manifest.pathnames,
+            i18n: toResolutionI18nConfig(manifest),
+            routes: routeGraph,
+            invokeMiddleware: invokeResolutionMiddleware,
+          });
+          const fallbackResolution = stripMiddlewareResponse(
+            fallbackUnresolvedResolution as unknown as JsonRecord
+          ) as ResolveRoutesResult;
+          if (
+            resolveResolutionPathname(fallbackResolution) !== null ||
+            fallbackResolution.redirect ||
+            fallbackResolution.externalRewrite ||
+            fallbackResolution.middlewareResponded ||
+            isRedirectResolution(fallbackResolution)
+          ) {
+            unresolvedResolution = fallbackUnresolvedResolution;
+            resolution = fallbackResolution;
+            break;
+          }
+        }
+      }
+
+      const resolutionI18nConfig = toResolutionI18nConfig(manifest);
+      if (
+        !shouldSendRequestBody(request.method) &&
+        resolution.redirect &&
+        resolutionI18nConfig &&
+        resolutionI18nConfig.localeDetection !== false &&
+        !isI18nRootPathname(
+          new URL(requestForResolution.url).pathname,
+          manifest.build.basePath
+        )
+      ) {
+        const localeStableUnresolvedResolution = await resolveRoutes({
+          url: new URL(requestForResolution.url),
+          buildId: manifest.build.buildId,
+          basePath: manifest.build.basePath,
+          requestBody: createEmptyBodyStream(),
+          headers: new Headers([...requestForResolution.headers.entries()]),
+          pathnames: manifest.pathnames,
+          i18n: {
+            ...resolutionI18nConfig,
+            localeDetection: false,
+          },
+          routes: routeGraph,
+          invokeMiddleware: invokeResolutionMiddleware,
+        });
+        const localeStableResolution = stripMiddlewareResponse(
+          localeStableUnresolvedResolution as unknown as JsonRecord
+        ) as ResolveRoutesResult;
+        if (
+          resolveResolutionPathname(localeStableResolution) !== null ||
+          localeStableResolution.externalRewrite ||
+          localeStableResolution.middlewareResponded ||
+          isRedirectResolution(localeStableResolution) ||
+          !localeStableResolution.redirect
+        ) {
+          unresolvedResolution = localeStableUnresolvedResolution;
+          resolution = localeStableResolution;
+        }
+      }
+
       if (resolution.redirect) {
+        const requestForRedirect = new URL(requestForResolution.url);
+        const redirectLocation = resolveRedirectLocationWithPreservedSearch({
+          location: resolution.redirect.url.toString(),
+          requestUrl: requestForRedirect,
+        });
         const response = new Response(null, {
           status: resolution.redirect.status,
           headers: {
-            location: resolution.redirect.url.toString(),
+            location: redirectLocation,
           },
         });
         return sanitizeProxyResponse(
@@ -2540,9 +3502,21 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       }
 
       if (isRedirectResolution(resolution)) {
+        const redirectHeaders = new Headers(resolution.resolvedHeaders ?? undefined);
+        const requestForRedirect = new URL(requestForResolution.url);
+        const existingLocation = redirectHeaders.get('location');
+        if (existingLocation) {
+          redirectHeaders.set(
+            'location',
+            resolveRedirectLocationWithPreservedSearch({
+              location: existingLocation,
+              requestUrl: requestForRedirect,
+            })
+          );
+        }
         const response = new Response(null, {
           status: resolution.status,
-          headers: resolution.resolvedHeaders ?? undefined,
+          headers: redirectHeaders,
         });
         return sanitizeProxyResponse(
           applyResolutionToResponse(response, resolution, resolution.status),
@@ -2594,8 +3568,21 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       });
 
       const resolvedResolutionPathname = resolveResolutionPathname(resolution);
-      const requestedResolutionPathname = normalizeIndexPathnameAlias(
+      const concreteResolvedPathname = resolveConcretePathnameFromRouteMatches(
         resolvedResolutionPathname,
+        resolution.routeMatches
+      );
+      const hasConcreteResolvedPathname =
+        typeof concreteResolvedPathname === 'string' &&
+        (routeOutputsByPathname.has(concreteResolvedPathname) ||
+          staticAssetsByPathname.has(concreteResolvedPathname) ||
+          prerenderArtifactsByPathname.has(concreteResolvedPathname));
+      const resolutionPathnameForRouting =
+        hasConcreteResolvedPathname
+          ? concreteResolvedPathname
+          : resolvedResolutionPathname;
+      const requestedResolutionPathname = normalizeIndexPathnameAlias(
+        resolutionPathnameForRouting,
         routeOutputsByPathname,
         staticAssetsByPathname,
         prerenderArtifactsByPathname
@@ -2638,10 +3625,15 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       const hasMatchedRouteOutput = normalizedEffectiveMatchedPathname
         ? routeOutputsByPathname.has(normalizedEffectiveMatchedPathname)
         : false;
+      const shouldPreferPrerenderRscStaticAsset =
+        !!matchedStaticAsset &&
+        matchedStaticAsset.sourceType === 'prerender' &&
+        isRscStaticAssetPath(matchedStaticAsset.pathname, routeGraph) &&
+        hasInterceptionMarker(matchedStaticAsset.pathname);
       if (
         matchedStaticAsset &&
         canServeStaticAssetDirectly(matchedStaticAsset, routeGraph) &&
-        !hasMatchedRouteOutput
+        (!hasMatchedRouteOutput || shouldPreferPrerenderRscStaticAsset)
       ) {
         const response = serveStaticAsset(
           request,
@@ -2693,6 +3685,16 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         (prerenderArtifact
           ? routeOutputsById.get(prerenderArtifact.parentOutputId)
           : undefined);
+      const isApiRequestPath =
+        upstreamRequestUrl.pathname === '/api' ||
+        upstreamRequestUrl.pathname.startsWith('/api/');
+      if (!routeOutput && !hasExplicitRouteMatch && isApiRequestPath) {
+        routeOutput = findDynamicOutputForPathname(
+          manifest.routeOutputs,
+          upstreamRequestUrl.pathname,
+          prerenderFallbackFalseByPathname
+        );
+      }
 
       if (
         !routeOutput &&
@@ -2718,6 +3720,21 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         );
       }
 
+      if (
+        routeOutput?.type === 'PAGES' &&
+        !hasLocalePrefix(upstreamRequestUrl.pathname, manifest.build.i18n)
+      ) {
+        const preferredAppRouteOutput = findAppRouteOutputForRequestPathname({
+          requestPathname: upstreamRequestUrl.pathname,
+          routeOutputsByPathname,
+          appRouteOutputs,
+          prerenderFallbackFalseByPathname,
+        });
+        if (preferredAppRouteOutput) {
+          routeOutput = preferredAppRouteOutput;
+        }
+      }
+
       const resolutionQuery = extractResolutionQuery(resolution);
       const mergedSearchParams = new URLSearchParams(upstreamRequestUrl.searchParams);
       appendQueryObject(mergedSearchParams, resolutionQuery);
@@ -2728,18 +3745,43 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           routeGraph,
         })
       );
+      if (
+        (routeOutput?.type === 'PAGES' || routeOutput?.type === 'PAGES_API') &&
+        routeOutput.pathname.includes('[')
+      ) {
+        overwriteQueryObject(
+          mergedSearchParams,
+          routeMatchesToQueryObject(resolution.routeMatches)
+        );
+      }
       if (middlewareRewriteUrl) {
         const middlewareRewriteSearchParams = new URL(
           middlewareRewriteUrl,
           upstreamRequestUrl
         ).searchParams;
-        appendSearchParams(mergedSearchParams, middlewareRewriteSearchParams);
+        overwriteSearchParams(mergedSearchParams, middlewareRewriteSearchParams);
       }
-      const invocationPathname = resolveInvocationPathname({
+      let invocationPathname = resolveInvocationPathname({
         requestPathname: upstreamRequestUrl.pathname,
         matchedPathname: normalizedEffectiveMatchedPathname,
         resolvedPathname: requestedResolutionPathname,
       });
+      if (
+        requestedResolutionPathname?.includes('[') &&
+        middlewareRewriteUrl
+      ) {
+        invocationPathname = new URL(
+          middlewareRewriteUrl,
+          upstreamRequestUrl
+        ).pathname;
+      }
+      if (
+        !middlewareRewriteUrl &&
+        requestedResolutionPathname &&
+        requestedResolutionPathname !== upstreamRequestUrl.pathname
+      ) {
+        invocationPathname = upstreamRequestUrl.pathname;
+      }
       if (!routeOutput) {
         const invocationAliasPathname = normalizeIndexPathnameAlias(
           invocationPathname,
@@ -2797,6 +3839,37 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           );
         }
       }
+      const realRequestPathname = getRealRequestPathnameForNotFound({
+        requestPathname: upstreamRequestUrl.pathname,
+        basePath: manifest.build.basePath,
+        assetPrefix: runtimeNextConfig.assetPrefix,
+        i18n: manifest.build.i18n,
+      });
+      if (
+        !routeOutput &&
+        realRequestPathname.startsWith('/_next/static/')
+      ) {
+        const staticAssetNotFoundResolution = ({
+          ...resolution,
+          status: 404,
+        } satisfies ResolveRoutesResult);
+        const staticAssetNotFoundResponse = new Response('Not Found', {
+          status: 404,
+          headers: {
+            'cache-control':
+              'private, no-cache, no-store, max-age=0, must-revalidate',
+            'content-type': 'text/plain; charset=utf-8',
+          },
+        });
+        return sanitizeProxyResponse(
+          applyResolutionToResponse(
+            staticAssetNotFoundResponse,
+            staticAssetNotFoundResolution,
+            404
+          ),
+          request
+        );
+      }
       const mergedSearch = mergedSearchParams.toString();
       const invocationSourceHeaders = middlewareRequestHeaders
         ? new Headers(middlewareRequestHeaders)
@@ -2823,10 +3896,69 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
               status: fallbackStatusOverride,
             } satisfies ResolveRoutesResult)
           : resolution;
+      if (!routeOutput && literalStatusOverride !== 500) {
+        const notFoundStaticAsset = resolveNotFoundStaticAsset(
+          staticAssetsByPathname,
+          manifest.build.basePath
+        );
+        if (
+          notFoundStaticAsset &&
+          canServeStaticAssetDirectly(notFoundStaticAsset, routeGraph)
+        ) {
+          const response = serveStaticAsset(
+            request,
+            adapterDir,
+            notFoundStaticAsset,
+            routeGraph
+          );
+          return sanitizeProxyResponse(
+            applyResolutionToResponse(response, invocationResolution, 404),
+            request
+          );
+        }
+      }
+      let effectiveInvocationPathname =
+        (isErrorFallback || isNotFoundFallback) && routeOutput
+          ? routeOutput.pathname
+          : invocationPathname;
+      const isRscRequest =
+        request.headers.get(routeGraph.rsc.header) === '1';
+      if (
+        routeOutput &&
+        isRscRequest &&
+        routeOutput.pathname.endsWith(routeGraph.rsc.suffix) &&
+        !routeOutput.pathname.includes('[') &&
+        !hasInterceptionMarker(routeOutput.pathname)
+      ) {
+        effectiveInvocationPathname = routeOutput.pathname;
+      }
+      const invocationRouteMatches =
+        routeOutput && routeOutput.pathname.includes('[')
+          ? resolution.routeMatches
+          : undefined;
+      const normalizedInvocationRouteMatches =
+        normalizeResolutionRouteMatches(invocationRouteMatches);
+
+      if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1') {
+        console.error('[adapter-bun] routing resolution', {
+          requestPathname: upstreamRequestUrl.pathname,
+          requestedResolutionPathname,
+          normalizedEffectiveMatchedPathname,
+          invocationPathname: effectiveInvocationPathname,
+          routeOutputPathname: routeOutput?.pathname,
+          routeOutputRuntime: routeOutput?.runtime,
+          resolutionRouteMatches: invocationRouteMatches ?? null,
+          resolutionStatus: resolution.status ?? null,
+          middlewareRewriteUrl,
+        });
+      }
 
       if (routeOutput?.runtime === 'edge') {
         const edgeHandler = await getEdgeRouteHandler(routeOutput);
-        const invocationUrl = new URL(invocationPathname, upstreamRequestUrl.origin);
+        const invocationUrl = new URL(
+          effectiveInvocationPathname,
+          upstreamRequestUrl.origin
+        );
         invocationUrl.search = mergedSearch.length > 0 ? `?${mergedSearch}` : '';
 
         const edgeRequestHeaders = new Headers(invocationSourceHeaders);
@@ -2866,7 +3998,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
                 ? 'prerender-parent'
                 : 'function',
             matchedPathname: normalizedEffectiveMatchedPathname ?? undefined,
-            routeMatches: resolution.routeMatches ?? null,
+            routeMatches: normalizedInvocationRouteMatches,
             query: searchParamsToQueryObject(mergedSearchParams),
             resolvedPathname: requestedResolutionPathname ?? undefined,
           },
@@ -2889,11 +4021,16 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           encodeRouteInvocationMeta({
             originalUrl: upstreamRequestUrl.toString(),
             resolvedPathname: requestedResolutionPathname ?? undefined,
-            routeMatches: resolution.routeMatches,
+            routeMatches: invocationRouteMatches,
+            source: isNotFoundFallback
+              ? 'not-found'
+              : isErrorFallback
+                ? 'error'
+                : undefined,
           })
         );
 
-        const internalUrl = new URL(invocationPathname, backendOrigin);
+        const internalUrl = new URL(effectiveInvocationPathname, backendOrigin);
         internalUrl.search = mergedSearch.length > 0 ? `?${mergedSearch}` : '';
 
         return proxyRequest(
@@ -2909,7 +4046,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
 
       if (
         hasOutputPathname(routeOutputsByPathname, '/') &&
-        invocationPathname === '/' &&
+        effectiveInvocationPathname === '/' &&
         !routeOutputsByPathname.has('/index')
       ) {
         const rootOutput = routeOutputsByPathname.get('/');
@@ -2921,7 +4058,14 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
             encodeRouteInvocationMeta({
               originalUrl: upstreamRequestUrl.toString(),
               resolvedPathname: requestedResolutionPathname ?? undefined,
-              routeMatches: resolution.routeMatches,
+              routeMatches: rootOutput.pathname.includes('[')
+                ? resolution.routeMatches
+                : undefined,
+              source: isNotFoundFallback
+                ? 'not-found'
+                : isErrorFallback
+                  ? 'error'
+                  : undefined,
             })
           );
           const internalUrl = new URL('/', backendOrigin);

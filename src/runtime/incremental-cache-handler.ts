@@ -16,6 +16,7 @@ import type {
 const MAP_MARKER = '__adapter_bun_type';
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 const NULL_CACHE_ENTRY_MARKER = '__adapter_bun_null_cache_entry';
+const DYNAMIC_TEMPLATE_CACHE = new WeakMap<object, string[]>();
 const KNOWN_CACHE_KINDS = new Set([
   'APP_PAGE',
   'APP_ROUTE',
@@ -208,6 +209,100 @@ function decodeStoredBodyText(row: {
   return Buffer.from(decodeStoredBodyBytes(row)).toString('utf8');
 }
 
+function stripInterceptionMarker(segment: string): string {
+  return segment.replace(/^\((?:\.\.\.|\.\.|\.)\)/, '');
+}
+
+function isDynamicSegment(segment: string): boolean {
+  const normalized = stripInterceptionMarker(segment);
+  return (
+    (normalized.startsWith('[[...') && normalized.endsWith(']]')) ||
+    (normalized.startsWith('[...') && normalized.endsWith(']')) ||
+    (normalized.startsWith('[') && normalized.endsWith(']'))
+  );
+}
+
+function templateMatchesPathname(
+  template: string,
+  pathname: string
+): boolean {
+  const templateSegments = template.split('/').filter(Boolean);
+  const concreteSegments = pathname.split('/').filter(Boolean);
+  let concreteIndex = 0;
+
+  for (const rawTemplateSegment of templateSegments) {
+    const templateSegment = stripInterceptionMarker(rawTemplateSegment);
+    if (
+      templateSegment.startsWith('[[...') &&
+      templateSegment.endsWith(']]')
+    ) {
+      return true;
+    }
+
+    if (
+      templateSegment.startsWith('[...') &&
+      templateSegment.endsWith(']')
+    ) {
+      return concreteIndex < concreteSegments.length;
+    }
+
+    if (
+      templateSegment.startsWith('[') &&
+      templateSegment.endsWith(']')
+    ) {
+      if (concreteSegments[concreteIndex] === undefined) {
+        return false;
+      }
+      concreteIndex += 1;
+      continue;
+    }
+
+    if (templateSegment !== concreteSegments[concreteIndex]) {
+      return false;
+    }
+    concreteIndex += 1;
+  }
+
+  return concreteIndex === concreteSegments.length;
+}
+
+function hasMatchingSpecializedDynamicTemplate(
+  store: ReturnType<typeof getSharedPrerenderCacheStore>,
+  pathname: string
+): boolean {
+  const templates =
+    DYNAMIC_TEMPLATE_CACHE.get(store as object) ??
+    (() => {
+      const resolvedTemplates = store
+        .findByPrefix('/')
+        .map((entry) => entry.cacheKey)
+        .filter(
+          (cacheKey) =>
+            cacheKey.includes('[') &&
+            !cacheKey.includes('.segments/') &&
+            !cacheKey.endsWith('.rsc')
+        );
+      DYNAMIC_TEMPLATE_CACHE.set(store as object, resolvedTemplates);
+      return resolvedTemplates;
+    })();
+
+  for (const template of templates) {
+    const templateSegments = template.split('/').filter(Boolean);
+    const hasStaticSegment = templateSegments.some(
+      (segment) => !isDynamicSegment(segment)
+    );
+    if (!hasStaticSegment) {
+      continue;
+    }
+
+    if (templateMatchesPathname(template, pathname)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function isCacheValue(value: unknown): value is IncrementalCacheValue {
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
@@ -223,10 +318,12 @@ function isNullCacheValue(value: unknown): boolean {
 function decodeSeededPrerenderValue(
   cacheKey: string,
   row: {
+    groupId: number;
     body: Uint8Array | string;
     bodyEncoding: 'binary' | 'base64';
     headers: Record<string, string>;
     status: number;
+    postponed?: string;
   },
   ctx: GetIncrementalFetchCacheContext | GetIncrementalResponseCacheContext,
   store: ReturnType<typeof getSharedPrerenderCacheStore>
@@ -241,10 +338,43 @@ function decodeSeededPrerenderValue(
   }
 
   if (ctx.kind === 'APP_PAGE') {
-    const html = decodeStoredBodyText(row);
-    const rscRow = store.get(`${cacheKey}.rsc`);
+    // Fully static app pages with an `.rsc` companion are better handled via
+    // Next's runtime population path; serving the raw seeded HTML entry for
+    // these keys causes client route-cache misses on repeat navigations.
+    //
+    // Keep concrete dynamic-route seeds that have specialized dynamic template
+    // siblings (e.g. /fr/[slug]) on the seeded path so known static params
+    // (e.g. /fr/1) remain build-time.
+    const hasMatchingDynamicTemplate = hasMatchingSpecializedDynamicTemplate(
+      store,
+      cacheKey
+    );
+    if (
+      !hasMatchingDynamicTemplate &&
+      !row.postponed &&
+      !cacheKey.includes('[') &&
+      !cacheKey.includes('.segments/') &&
+      !cacheKey.endsWith('.rsc') &&
+      store.get(`${cacheKey}.rsc`)
+    ) {
+      return null;
+    }
+
+    const segmentIndex = cacheKey.indexOf('.segments/');
+    const isRscVariantKey = segmentIndex < 0 && cacheKey.endsWith('.rsc');
+    const baseCacheKey =
+      segmentIndex >= 0
+        ? cacheKey.slice(0, segmentIndex)
+        : isRscVariantKey
+          ? cacheKey.slice(0, -'.rsc'.length)
+          : cacheKey;
+    const baseRow =
+      baseCacheKey !== cacheKey ? (store.get(baseCacheKey) ?? null) : row;
+
+    const html = baseRow ? decodeStoredBodyText(baseRow) : decodeStoredBodyText(row);
+    const rscRow = isRscVariantKey ? row : store.get(`${baseCacheKey}.rsc`);
     const rscData = rscRow ? decodeStoredBodyBuffer(rscRow) : undefined;
-    const segmentRows = store.findByPrefix(`${cacheKey}.segments/`);
+    const segmentRows = store.findByPrefix(`${baseCacheKey}.segments/`);
     const segmentData = new Map<string, Buffer>();
 
     for (const segmentRow of segmentRows) {
@@ -252,7 +382,7 @@ function decodeSeededPrerenderValue(
         continue;
       }
       const segmentPath = segmentRow.cacheKey.slice(
-        `${cacheKey}.segments`.length,
+        `${baseCacheKey}.segments`.length,
         -SEGMENT_RSC_SUFFIX.length
       );
       if (segmentPath.length === 0) {
@@ -265,9 +395,9 @@ function decodeSeededPrerenderValue(
       kind: 'APP_PAGE',
       html,
       rscData,
-      headers: row.headers,
-      postponed: undefined,
-      status: row.status,
+      headers: isRscVariantKey ? row.headers : (baseRow?.headers ?? row.headers),
+      postponed: baseRow?.postponed ?? row.postponed,
+      status: baseRow?.status ?? row.status,
       segmentData: segmentData.size > 0 ? segmentData : undefined,
     } as IncrementalCacheValue;
   }
@@ -333,6 +463,13 @@ export default class BunSqliteIncrementalCacheHandler
   ): Promise<CacheHandlerValue | null> {
     const store = getSharedPrerenderCacheStore();
     const row = store.get(cacheKey);
+    if (process.env.ADAPTER_BUN_DEBUG_CACHE === '1') {
+      console.error('[adapter-bun] incremental-cache.get', {
+        cacheKey,
+        kind: ctx.kind,
+        hit: !!row,
+      });
+    }
     if (!row) {
       return null;
     }

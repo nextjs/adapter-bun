@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS prerender_entries (
   created_at INTEGER NOT NULL,
   revalidate_at INTEGER,
   expires_at INTEGER,
+  postponed TEXT,
   cache_query TEXT,
   cache_headers TEXT
 );
@@ -93,6 +94,7 @@ type PrerenderEntryRow = {
   created_at: number;
   revalidate_at: number | null;
   expires_at: number | null;
+  postponed: string | null;
   cache_query: string | null;
   cache_headers: string | null;
 };
@@ -164,6 +166,7 @@ export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
       createdAt: row.created_at,
       revalidateAt: row.revalidate_at,
       expiresAt: row.expires_at,
+      postponed: row.postponed ?? undefined,
       cacheQuery: row.cache_query
         ? (JSON.parse(row.cache_query) as Record<string, string[]>)
         : undefined,
@@ -203,8 +206,8 @@ export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
         .query(
           `INSERT OR REPLACE INTO prerender_entries
            (cache_key, pathname, group_id, status, headers, body, body_encoding,
-            created_at, revalidate_at, expires_at, cache_query, cache_headers)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            created_at, revalidate_at, expires_at, postponed, cache_query, cache_headers)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           cacheKey,
@@ -217,6 +220,7 @@ export class SqlitePrerenderCacheStore implements PrerenderCacheStore {
           entry.createdAt,
           entry.revalidateAt,
           entry.expiresAt,
+          entry.postponed ?? null,
           entry.cacheQuery ? JSON.stringify(entry.cacheQuery) : null,
           entry.cacheHeaders ? JSON.stringify(entry.cacheHeaders) : null
         );

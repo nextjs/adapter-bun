@@ -47,13 +47,26 @@ function safePathnameToObjectKey(pathname: string): string {
   return trimmed.length > 0 ? trimmed : INDEX_OBJECT_KEY;
 }
 
+function hasPathnameExtension(objectKey: string): boolean {
+  const segments = objectKey.split('/');
+  const lastSegment = segments[segments.length - 1] ?? '';
+  const withoutInterceptionPrefix = lastSegment
+    .replace(/^\(\.\.\.\)/, '')
+    .replace(/^\(\.\.\)/, '')
+    .replace(/^\(\.\)/, '');
+  return path.posix.extname(withoutInterceptionPrefix).length > 0;
+}
+
 function buildStaticObjectKey(pathname: string, sourcePath: string): string {
   const baseKey = safePathnameToObjectKey(pathname);
   const sourceExtension = path.extname(sourcePath);
-  const hasExtension = path.posix.extname(baseKey).length > 0;
+  const hasExtension = hasPathnameExtension(baseKey);
 
-  if (sourceExtension === '.html' && !hasExtension) {
-    return `${baseKey}.html`;
+  if (!hasExtension && sourceExtension.length > 0) {
+    return `${baseKey}${sourceExtension}`;
+  }
+  if (!hasExtension) {
+    return path.posix.join(baseKey, INDEX_OBJECT_KEY);
   }
 
   return baseKey;
@@ -83,7 +96,22 @@ async function copyToOutDir({
 }): Promise<void> {
   const normalizedRelativePath = normalizeRelativePath(relativePath);
   const destinationPath = resolveInside(outDir, normalizedRelativePath);
-  await mkdir(path.dirname(destinationPath), { recursive: true });
+  const destinationDir = path.dirname(destinationPath);
+  try {
+    await mkdir(destinationDir, { recursive: true });
+  } catch (error) {
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: string }).code === 'EEXIST'
+    ) {
+      throw new Error(
+        `Failed to create destination directory "${destinationDir}" while staging "${sourcePath}" as "${normalizedRelativePath}"`
+      );
+    }
+    throw error;
+  }
 
   const sourceLStat = await lstat(sourcePath);
   let sourceCopyPath = sourcePath;

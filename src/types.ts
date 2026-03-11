@@ -59,6 +59,7 @@ export interface BunMiddlewareArtifact {
   assets?: Record<string, string>;
   wasmAssets?: Record<string, string>;
   env?: NonNullable<BuildCompleteMiddlewareOutput['config']['env']>;
+  matchers?: NonNullable<BuildCompleteMiddlewareOutput['config']['matchers']>;
 }
 
 export interface BunRouteArtifact {
