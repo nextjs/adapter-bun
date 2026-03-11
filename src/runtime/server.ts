@@ -2459,6 +2459,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         : request;
       let middlewareRequestHeaders: Headers | null = null;
       let middlewareRewriteUrl: string | null = null;
+      let middlewareResponsePayload: Response | null = null;
 
       const unresolvedResolution = await resolveRoutes({
         url: new URL(requestForResolution.url),
@@ -2496,11 +2497,15 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
             },
           });
 
+          const middlewareResponse = await toResponse(middlewareResult);
           const middlewareResolved = responseToMiddlewareResult(
-            await toResponse(middlewareResult),
+            middlewareResponse,
             new Headers(headers),
             url
           );
+          if (middlewareResolved.bodySent) {
+            middlewareResponsePayload = middlewareResponse;
+          }
           if (middlewareResolved.requestHeaders) {
             middlewareRequestHeaders = new Headers(
               middlewareResolved.requestHeaders
@@ -2557,6 +2562,12 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       }
 
       if (resolution.middlewareResponded) {
+        if (middlewareResponsePayload) {
+          return sanitizeProxyResponse(
+            applyResolutionToResponse(middlewareResponsePayload, resolution),
+            request
+          );
+        }
         return sanitizeProxyResponse(
           applyResolutionToResponse(
             new Response('Middleware response payload was not provided', {
