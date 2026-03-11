@@ -4,6 +4,19 @@ export type BuildCompleteContext = Parameters<
   NonNullable<NextAdapter['onBuildComplete']>
 >[0];
 
+export type BunRouteGraph = BuildCompleteContext['routing'];
+
+type BuildCompleteMiddlewareOutput = NonNullable<
+  BuildCompleteContext['outputs']['middleware']
+>;
+type BuildCompleteRouteOutput =
+  | BuildCompleteContext['outputs']['pages'][number]
+  | BuildCompleteContext['outputs']['pagesApi'][number]
+  | BuildCompleteContext['outputs']['appPages'][number]
+  | BuildCompleteContext['outputs']['appRoutes'][number];
+type BuildCompletePrerenderOutput =
+  BuildCompleteContext['outputs']['prerenders'][number];
+
 export interface BunAdapterOptions {
   /**
    * Relative output path under the project directory (or absolute path).
@@ -27,12 +40,43 @@ export interface BunAdapterOptions {
 export interface BunStaticAsset {
   id: string;
   pathname: string;
-  sourceType: 'next-static' | 'public';
+  sourceType: 'next-static' | 'public' | 'prerender';
   sourcePath: string;
   stagedPath: string;
   objectKey: string;
+  status: number;
+  headers?: Record<string, string>;
   contentType: string | null;
   cacheControl: string | null;
+}
+
+export interface BunMiddlewareArtifact {
+  id: BuildCompleteMiddlewareOutput['id'];
+  pathname: BuildCompleteMiddlewareOutput['pathname'];
+  sourcePage: BuildCompleteMiddlewareOutput['sourcePage'];
+  runtime: BuildCompleteMiddlewareOutput['runtime'];
+  filePath: string;
+  assets?: Record<string, string>;
+  wasmAssets?: Record<string, string>;
+  env?: NonNullable<BuildCompleteMiddlewareOutput['config']['env']>;
+}
+
+export interface BunRouteArtifact {
+  id: BuildCompleteRouteOutput['id'];
+  pathname: BuildCompleteRouteOutput['pathname'];
+  sourcePage: BuildCompleteRouteOutput['sourcePage'];
+  runtime: BuildCompleteRouteOutput['runtime'];
+  type: BuildCompleteRouteOutput['type'];
+  filePath: string;
+  assets?: Record<string, string>;
+  wasmAssets?: Record<string, string>;
+  env?: NonNullable<BuildCompleteRouteOutput['config']['env']>;
+}
+
+export interface BunPrerenderArtifact {
+  id: BuildCompletePrerenderOutput['id'];
+  pathname: BuildCompletePrerenderOutput['pathname'];
+  parentOutputId: BuildCompletePrerenderOutput['parentOutputId'];
 }
 
 export interface BunDeploymentManifest {
@@ -57,17 +101,17 @@ export interface BunDeploymentManifest {
     hostname: string;
   };
   pathnames: string[];
+  prerenderedPathnames: string[];
+  prerenderArtifacts: BunPrerenderArtifact[];
+  routeOutputs: BunRouteArtifact[];
+  routeGraph: BunRouteGraph;
+  middleware?: BunMiddlewareArtifact | null;
   runtime?: {
     previewProps?: {
       previewModeId: string;
       previewModeSigningKey: string;
       previewModeEncryptionKey: string;
     } | null;
-    routing?: {
-      hasMiddleware: boolean;
-      hasBeforeFilesRewrites: boolean;
-      staticAssetFastPathEnabled: boolean;
-    };
   };
   staticAssets: BunStaticAsset[];
   summary: {

@@ -1,4 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { Database } from 'bun:sqlite';
@@ -6,6 +7,7 @@ import type { NextAdapter } from 'next';
 import type { AdapterOutput } from 'next';
 import {
   buildDeploymentManifest,
+  collectPrerenderedPathnames,
   collectOutputPathnames,
 } from './manifest.ts';
 import { SCHEMA_SQL } from './runtime/sqlite-cache.ts';
@@ -17,6 +19,9 @@ import {
 import type {
   BunAdapterOptions,
   BunDeploymentManifest,
+  BunMiddlewareArtifact,
+  BunPrerenderArtifact,
+  BunRouteArtifact,
   BuildCompleteContext,
 } from './types.ts';
 
@@ -31,14 +36,17 @@ const CACHE_RUNTIME_MODULES = [
   'cache-store.js',
   'sqlite-cache.js',
   'isr.js',
+  'server.js',
 ];
+const EXTERNAL_RUNTIME_MODULES = [
+  {
+    sourcePath: createRequire(import.meta.url).resolve('@next/routing'),
+    outputName: 'next-routing.cjs',
+  },
+] as const;
 
 type PreviewProps = NonNullable<
   NonNullable<BunDeploymentManifest['runtime']>['previewProps']
->;
-
-type RuntimeRoutingInfo = NonNullable<
-  NonNullable<BunDeploymentManifest['runtime']>['routing']
 >;
 
 function normalizeDeploymentHost(value: string | undefined): string | null {
@@ -109,20 +117,99 @@ function toJsonRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function readRuntimeRoutingInfo(ctx: BuildCompleteContext): RuntimeRoutingInfo {
-  const configRecord = toJsonRecord(ctx.config);
-  const originalRewrites = toJsonRecord(configRecord._originalRewrites);
-  const beforeFiles = Array.isArray(originalRewrites.beforeFiles)
-    ? originalRewrites.beforeFiles
-    : [];
-  const hasMiddleware = Boolean(ctx.outputs.middleware);
-  const hasBeforeFilesRewrites = beforeFiles.length > 0;
+function resolveDistDirPath(ctx: BuildCompleteContext): string {
+  return path.isAbsolute(ctx.distDir)
+    ? ctx.distDir
+    : path.join(ctx.projectDir, ctx.distDir);
+}
 
-  return {
-    hasMiddleware,
-    hasBeforeFilesRewrites,
-    staticAssetFastPathEnabled: !hasMiddleware && !hasBeforeFilesRewrites,
+function toPosixRelativePath(basePath: string, targetPath: string): string {
+  return path.relative(basePath, targetPath).replace(/\\/g, '/');
+}
+
+function serializeMiddlewareOutput(
+  ctx: BuildCompleteContext
+): BunMiddlewareArtifact | null {
+  const middlewareOutput = ctx.outputs.middleware;
+  if (!middlewareOutput) {
+    return null;
+  }
+
+  const distDirPath = resolveDistDirPath(ctx);
+  const serialized: BunMiddlewareArtifact = {
+    id: middlewareOutput.id,
+    pathname: middlewareOutput.pathname,
+    sourcePage: middlewareOutput.sourcePage,
+    runtime: middlewareOutput.runtime,
+    filePath: toPosixRelativePath(distDirPath, middlewareOutput.filePath),
+    env: middlewareOutput.config.env ?? undefined,
   };
+
+  if (middlewareOutput.runtime === 'edge') {
+    serialized.assets = Object.fromEntries(
+      Object.entries(middlewareOutput.assets).map(([name, assetPath]) => [
+        name,
+        toPosixRelativePath(distDirPath, assetPath),
+      ])
+    );
+
+    if (middlewareOutput.wasmAssets) {
+      serialized.wasmAssets = Object.fromEntries(
+        Object.entries(middlewareOutput.wasmAssets).map(([name, assetPath]) => [
+          name,
+          toPosixRelativePath(distDirPath, assetPath),
+        ])
+      );
+    }
+  }
+
+  return serialized;
+}
+
+function serializeRouteOutputs(ctx: BuildCompleteContext): BunRouteArtifact[] {
+  const distDirPath = resolveDistDirPath(ctx);
+  const outputs = [
+    ...ctx.outputs.pages,
+    ...ctx.outputs.pagesApi,
+    ...ctx.outputs.appPages,
+    ...ctx.outputs.appRoutes,
+  ];
+
+  return outputs.map((output) => ({
+    id: output.id,
+    pathname: output.pathname,
+    sourcePage: output.sourcePage,
+    runtime: output.runtime,
+    type: output.type,
+    filePath: toPosixRelativePath(distDirPath, output.filePath),
+    assets:
+      output.runtime === 'edge'
+        ? Object.fromEntries(
+            Object.entries(output.assets).map(([name, assetPath]) => [
+              name,
+              toPosixRelativePath(distDirPath, assetPath),
+            ])
+          )
+        : undefined,
+    wasmAssets:
+      output.runtime === 'edge' && output.wasmAssets
+        ? Object.fromEntries(
+            Object.entries(output.wasmAssets).map(([name, assetPath]) => [
+              name,
+              toPosixRelativePath(distDirPath, assetPath),
+            ])
+          )
+        : undefined,
+    env: output.runtime === 'edge' ? output.config.env ?? undefined : undefined,
+  }));
+}
+
+function serializePrerenderOutputs(ctx: BuildCompleteContext): BunPrerenderArtifact[] {
+  return ctx.outputs.prerenders.map((output) => ({
+    id: output.id,
+    pathname: output.pathname,
+    parentOutputId: output.parentOutputId,
+  }));
 }
 
 function createRuntimeNextConfig(
@@ -137,16 +224,6 @@ function createRuntimeNextConfig(
 
   const configRecord = toJsonRecord(cloned);
   delete configRecord.outputFileTracingRoot;
-  delete configRecord.cacheHandler;
-
-  const cacheHandlersValue = configRecord.cacheHandlers;
-  if (cacheHandlersValue && typeof cacheHandlersValue === 'object') {
-    const cacheHandlers = {
-      ...(cacheHandlersValue as Record<string, unknown>),
-    };
-    delete cacheHandlers.remote;
-    configRecord.cacheHandlers = cacheHandlers;
-  }
 
   const experimentalValue = configRecord.experimental;
   if (experimentalValue && typeof experimentalValue === 'object') {
@@ -168,638 +245,12 @@ async function writeRuntimeNextConfig(
   await writeJsonFile(path.join(outDir, RUNTIME_NEXT_CONFIG_FILE), runtimeNextConfig);
 }
 
-const SERVER_ENTRY_TEMPLATE = `import path from 'node:path';
-import http from 'node:http';
-import { Readable } from 'node:stream';
+const SERVER_ENTRY_TEMPLATE = `import { startServer } from './runtime/server.js';
 
-const adapterDir = import.meta.dirname;
-const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
-const manifest = await Bun.file(manifestPath).json();
-
-// NEXT_ADAPTER_PATH is required at build-time to activate adapter hooks, but
-// keeping it at runtime changes Next.js request handling branches in ways that
-// conflict with this standalone server entry.
-delete process.env.NEXT_ADAPTER_PATH;
-
-// Tell the cache handler where to find cache.db
-process.env.BUN_ADAPTER_CACHE_DB_PATH = path.join(adapterDir, 'cache.db');
-
-// Resolve project directory (parent of bun-dist/)
-const projectDir = process.env.NEXT_PROJECT_DIR || path.resolve(adapterDir, '..');
-
-const requestedPort = Number.parseInt(process.env.PORT || '', 10);
-const port =
-  Number.isFinite(requestedPort) && requestedPort > 0
-    ? requestedPort
-    : manifest.server.port;
-const listenHostname = manifest.server.hostname;
-const isWildcardHostname = (value) => value === '0.0.0.0' || value === '::';
-const configuredHostname = process.env.NEXT_HOSTNAME || '';
-const appHostname =
-  configuredHostname &&
-  !isWildcardHostname(configuredHostname)
-    ? configuredHostname
-    : !isWildcardHostname(listenHostname)
-      ? listenHostname
-      : 'localhost';
-const protocol = process.env.__NEXT_EXPERIMENTAL_HTTPS === '1' ? 'https' : 'http';
-
-// Next's forwarded action/redirect fetches rely on this internal origin.
-process.env.__NEXT_PRIVATE_ORIGIN = protocol + '://' + appHostname + ':' + port;
-
-async function loadRuntimeNextConfig() {
-  const runtimeNextConfigPath = path.join(
-    adapterDir,
-    '${RUNTIME_NEXT_CONFIG_FILE}'
-  );
-
-  let serializedConfig = {};
-  try {
-    const loadedConfig = await Bun.file(runtimeNextConfigPath).json();
-    if (loadedConfig && typeof loadedConfig === 'object') {
-      serializedConfig = loadedConfig;
-    }
-  } catch (error) {
-    console.warn(
-      '[adapter-bun] failed to load adapter runtime next config:',
-      error
-    );
-  }
-
-  const configRecord =
-    serializedConfig && typeof serializedConfig === 'object' ? serializedConfig : {};
-  const distDir =
-    typeof configRecord.distDir === 'string' && configRecord.distDir.length > 0
-      ? configRecord.distDir
-      : typeof manifest.build?.distDir === 'string' && manifest.build.distDir.length > 0
-        ? manifest.build.distDir
-        : '.next';
-  const runtimeCacheHandlerPath = path.join(
-    adapterDir,
-    'runtime',
-    'incremental-cache-handler.js'
-  );
-  const runtimeRemoteCacheHandlerPath = path.join(
-    adapterDir,
-    'runtime',
-    'cache-handler.js'
-  );
-  const existingCacheHandlers =
-    configRecord.cacheHandlers && typeof configRecord.cacheHandlers === 'object'
-      ? configRecord.cacheHandlers
-      : {};
-
-  return {
-    ...configRecord,
-    distDir,
-    cacheHandler: runtimeCacheHandlerPath,
-    cacheHandlers: {
-      ...existingCacheHandlers,
-      remote: runtimeRemoteCacheHandlerPath,
-    },
-  };
-}
-
-const runtimeNextConfig = await loadRuntimeNextConfig();
-const createNext = (await import('next')).default;
-const app = createNext({
-  dir: projectDir,
-  dev: false,
-  quiet: false,
-  hostname: appHostname,
-  port,
-  conf: runtimeNextConfig
+await startServer({
+  adapterDir: import.meta.dirname,
+  runtimeNextConfigFile: '${RUNTIME_NEXT_CONFIG_FILE}',
 });
-await app.prepare();
-const handle = app.getRequestHandler();
-const routingConfig =
-  manifest.runtime &&
-  typeof manifest.runtime === 'object' &&
-  manifest.runtime.routing &&
-  typeof manifest.runtime.routing === 'object'
-    ? manifest.runtime.routing
-    : {};
-const staticAssetFastPathEnabled = Boolean(routingConfig.staticAssetFastPathEnabled);
-const staticAssetsByPathname = staticAssetFastPathEnabled
-  ? new Map(
-      (Array.isArray(manifest.staticAssets) ? manifest.staticAssets : []).map((asset) => [
-        asset.pathname,
-        asset,
-      ])
-    )
-  : null;
-
-function getSingleHeaderValue(value) {
-  return Array.isArray(value) ? value[0] : value;
-}
-
-async function prepareActionRequestBodyForBun(req) {
-  if (req.method !== 'POST') {
-    return;
-  }
-
-  const actionId = getSingleHeaderValue(req.headers['next-action']);
-  if (typeof actionId !== 'string' || actionId.length === 0) {
-    return;
-  }
-
-  const chunks = [];
-  for await (const chunk of req) {
-    if (chunk === undefined || chunk === null) {
-      continue;
-    }
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  const requestBody = Buffer.concat(chunks);
-
-  // Bun's IncomingMessage can complete before Next attaches stream listeners
-  // for forwarded Server Actions. Replaying a buffered body keeps request
-  // consumption semantics stable while letting Next own action routing.
-  if (requestBody.length > 0) {
-    req.headers['content-length'] = String(requestBody.length);
-  } else {
-    req.headers['content-length'] = '0';
-  }
-  delete req.headers['transfer-encoding'];
-
-  const replayStream = Readable.from(requestBody);
-  const originalOn = req.on.bind(req);
-  const originalOnce = req.once.bind(req);
-  const originalRemoveListener = req.removeListener.bind(req);
-
-  req.on = (event, listener) => {
-    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
-      replayStream.on(event, listener);
-      return req;
-    }
-    return originalOn(event, listener);
-  };
-
-  req.once = (event, listener) => {
-    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
-      replayStream.once(event, listener);
-      return req;
-    }
-    return originalOnce(event, listener);
-  };
-
-  req.removeListener = (event, listener) => {
-    if (event === 'data' || event === 'end' || event === 'error' || event === 'readable') {
-      replayStream.removeListener(event, listener);
-      return req;
-    }
-    return originalRemoveListener(event, listener);
-  };
-
-  req.pipe = replayStream.pipe.bind(replayStream);
-  req.read = replayStream.read.bind(replayStream);
-  req.pause = replayStream.pause.bind(replayStream);
-  req.resume = replayStream.resume.bind(replayStream);
-  req.setEncoding = replayStream.setEncoding.bind(replayStream);
-  req.unshift = replayStream.unshift.bind(replayStream);
-  req[Symbol.asyncIterator] = replayStream[Symbol.asyncIterator].bind(replayStream);
-}
-
-function getHeaderValue(headers, name) {
-  if (!headers || typeof headers !== 'object') {
-    return undefined;
-  }
-
-  for (const [key, value] of Object.entries(headers)) {
-    if (typeof key === 'string' && key.toLowerCase() === name.toLowerCase()) {
-      return value;
-    }
-  }
-
-  return undefined;
-}
-
-function normalizeCacheControlHeader(req, value, nextCacheHeaderValue) {
-  const raw = Array.isArray(value) ? value.join(', ') : String(value ?? '');
-  const normalized = raw.trim();
-  if (normalized.length === 0) return raw;
-
-  const lower = normalized.toLowerCase();
-  const hasNextCacheMarker =
-    typeof nextCacheHeaderValue === 'string' && nextCacheHeaderValue.length > 0;
-  const isDataRequest =
-    typeof req.url === 'string' && req.url.includes('/_next/data/');
-
-  if (
-    hasNextCacheMarker &&
-    !isDataRequest &&
-    lower === 'private, no-cache, no-store, max-age=0, must-revalidate'
-  ) {
-    // Pages-router fallback HTML responses in deploy mode still flow through
-    // Next's private no-store branch on the first MISS. Deployed environments
-    // expose these as public must-revalidate responses instead.
-    return 'public, max-age=0, must-revalidate';
-  }
-
-  if (lower.includes('immutable')) {
-    return normalized;
-  }
-
-  if (lower.includes('s-maxage=')) {
-    return 'public, max-age=0, must-revalidate';
-  }
-
-  return normalized;
-}
-
-function patchCacheControlHeader(req, res) {
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    return;
-  }
-
-  const originalSetHeader = res.setHeader.bind(res);
-  res.setHeader = (name, value) => {
-    if (typeof name === 'string' && name.toLowerCase() === 'cache-control') {
-      return originalSetHeader(
-        name,
-        normalizeCacheControlHeader(req, value, res.getHeader('x-nextjs-cache'))
-      );
-    }
-    return originalSetHeader(name, value);
-  };
-
-  const originalWriteHead = res.writeHead.bind(res);
-  res.writeHead = (statusCode, statusMessage, headers) => {
-    let resolvedStatusMessage = statusMessage;
-    let resolvedHeaders = headers;
-
-    if (
-      resolvedHeaders === undefined &&
-      resolvedStatusMessage &&
-      typeof resolvedStatusMessage === 'object' &&
-      !Array.isArray(resolvedStatusMessage)
-    ) {
-      resolvedHeaders = resolvedStatusMessage;
-      resolvedStatusMessage = undefined;
-    }
-
-    if (resolvedHeaders && typeof resolvedHeaders === 'object') {
-      const nextCacheHeaderValue =
-        getHeaderValue(resolvedHeaders, 'x-nextjs-cache') ??
-        res.getHeader('x-nextjs-cache');
-      for (const key of Object.keys(resolvedHeaders)) {
-        if (key.toLowerCase() !== 'cache-control') {
-          continue;
-        }
-        resolvedHeaders[key] = normalizeCacheControlHeader(
-          req,
-          resolvedHeaders[key],
-          nextCacheHeaderValue
-        );
-      }
-    }
-
-    if (resolvedStatusMessage === undefined) {
-      return originalWriteHead(statusCode, resolvedHeaders);
-    }
-
-    return originalWriteHead(statusCode, resolvedStatusMessage, resolvedHeaders);
-  };
-}
-
-function shouldProxyRequestBody(method) {
-  return method !== 'GET' && method !== 'HEAD';
-}
-
-function getRequestUserAgent(request) {
-  const userAgent = request.headers.get('user-agent');
-  return typeof userAgent === 'string' ? userAgent : '';
-}
-
-function shouldForceConnectionClose(request) {
-  return getRequestUserAgent(request).includes('node-fetch');
-}
-
-function getForwardedPort(url) {
-  if (url.port) {
-    return url.port;
-  }
-  return url.protocol === 'https:' ? '443' : '80';
-}
-
-function buildProxyHeaders(request, server) {
-  const headers = new Headers(request.headers);
-  const url = new URL(request.url);
-
-  if (!headers.has('host')) {
-    headers.set('host', url.host);
-  }
-  if (!headers.has('x-forwarded-host')) {
-    headers.set('x-forwarded-host', url.host);
-  }
-  if (!headers.has('x-forwarded-proto')) {
-    headers.set('x-forwarded-proto', url.protocol.slice(0, -1));
-  }
-  if (!headers.has('x-forwarded-port')) {
-    headers.set('x-forwarded-port', getForwardedPort(url));
-  }
-  headers.set('accept-encoding', 'identity');
-
-  if (!headers.has('x-forwarded-for')) {
-    const requestIp = server.requestIP(request);
-    if (requestIp && typeof requestIp.address === 'string' && requestIp.address.length > 0) {
-      headers.set('x-forwarded-for', requestIp.address);
-    }
-  }
-
-  if (headers.get('rsc') === '1') {
-    const accept = headers.get('accept');
-    if (!accept || accept === '*/*') {
-      headers.set('accept', 'text/x-component');
-    }
-    if (request.method === 'GET' && headers.has('content-type')) {
-      headers.delete('content-type');
-    }
-  }
-
-  return headers;
-}
-
-function sanitizeProxyResponse(response, request) {
-  const headers = new Headers(response.headers);
-  headers.delete('connection');
-  headers.delete('keep-alive');
-  headers.delete('transfer-encoding');
-  if (shouldForceConnectionClose(request)) {
-    headers.set('connection', 'close');
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
-}
-
-function isHtmlStaticAsset(asset) {
-  return (
-    typeof asset.contentType === 'string' &&
-    asset.contentType.toLowerCase().startsWith('text/html')
-  );
-}
-
-function trimTrailingSlashes(pathname) {
-  if (pathname === '/') {
-    return pathname;
-  }
-  const trimmed = pathname.replace(/\\/+$/, '');
-  return trimmed.length > 0 ? trimmed : '/';
-}
-
-function getCanonicalStaticAssetPathname(asset) {
-  if (!isHtmlStaticAsset(asset) || asset.pathname === '/') {
-    return asset.pathname;
-  }
-  return manifest.build.trailingSlash ? asset.pathname + '/' : asset.pathname;
-}
-
-function pathnameLooksLikeFile(pathname) {
-  const normalizedPathname = trimTrailingSlashes(pathname);
-  const segments = normalizedPathname.split('/');
-  const lastSegment = segments[segments.length - 1] || '';
-  return lastSegment.includes('.');
-}
-
-function buildRedirectLocation(requestUrl, pathname) {
-  return pathname + requestUrl.search;
-}
-
-function createRedirectResponse(request, requestUrl, pathname) {
-  const response = Response.redirect(buildRedirectLocation(requestUrl, pathname), 308);
-  if (shouldForceConnectionClose(request)) {
-    response.headers.set('connection', 'close');
-  }
-  return response;
-}
-
-function maybeHandleTrailingSlashRedirect(request) {
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    return null;
-  }
-
-  const requestUrl = new URL(request.url);
-  const pathname = requestUrl.pathname;
-  if (pathname === '/' || pathname === '/.well-known' || pathname.startsWith('/.well-known/')) {
-    return null;
-  }
-
-  const trimmedPathname = trimTrailingSlashes(pathname);
-  const hasTrailingSlash = pathname.endsWith('/');
-  const looksLikeFile = pathnameLooksLikeFile(pathname);
-
-  if (manifest.build.trailingSlash) {
-    if (!looksLikeFile && !hasTrailingSlash) {
-      return createRedirectResponse(request, requestUrl, trimmedPathname + '/');
-    }
-    if (looksLikeFile && hasTrailingSlash) {
-      return createRedirectResponse(request, requestUrl, trimmedPathname);
-    }
-    return null;
-  }
-
-  if (hasTrailingSlash) {
-    return createRedirectResponse(request, requestUrl, trimmedPathname);
-  }
-
-  return null;
-}
-
-function getStaticAsset(request) {
-  if (!staticAssetsByPathname) {
-    return null;
-  }
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    return null;
-  }
-
-  const requestUrl = new URL(request.url);
-  const pathname = requestUrl.pathname;
-
-  const directMatch = staticAssetsByPathname.get(pathname);
-  if (directMatch) {
-    return {
-      asset: directMatch,
-      pathname,
-    };
-  }
-
-  const trimmedPathname = trimTrailingSlashes(pathname);
-  if (trimmedPathname !== pathname) {
-    const normalizedMatch = staticAssetsByPathname.get(trimmedPathname);
-    if (normalizedMatch) {
-      return {
-        asset: normalizedMatch,
-        pathname,
-      };
-    }
-  }
-
-  return null;
-}
-
-function buildStaticAssetHeaders(file, asset) {
-  const headers = new Headers();
-  if (asset.cacheControl) {
-    headers.set('cache-control', asset.cacheControl);
-  }
-
-  const contentType = asset.contentType || file.type;
-  if (contentType) {
-    headers.set('content-type', contentType);
-  }
-  if (typeof file.size === 'number' && Number.isFinite(file.size) && file.size >= 0) {
-    headers.set('content-length', String(file.size));
-  }
-
-  return headers;
-}
-
-function serveStaticAsset(request, asset) {
-  const file = Bun.file(path.join(adapterDir, asset.stagedPath));
-  const headers = buildStaticAssetHeaders(file, asset);
-  if (shouldForceConnectionClose(request)) {
-    headers.set('connection', 'close');
-  }
-
-  if (request.method === 'HEAD') {
-    return new Response(null, {
-      status: 200,
-      headers,
-    });
-  }
-
-  return new Response(file, {
-    status: 200,
-    headers,
-  });
-}
-
-const backendServer = http.createServer(async (req, res) => {
-  // Normalize Bun's incoming headers into a plain mutable object so Next can
-  // safely patch/strip headers during RSC/action flows.
-  req.headers = { ...req.headers };
-  patchCacheControlHeader(req, res);
-
-  const userAgent =
-    typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
-  if (userAgent.includes('node-fetch')) {
-    // node-fetch@2 can reuse a keep-alive socket across mixed request methods
-    // and hit ECONNRESET against the Bun->Node bridge. Force connection close
-    // for its requests so each request gets a fresh socket.
-    req.headers.connection = 'close';
-    res.setHeader('connection', 'close');
-  }
-
-  // Some Bun fetch requests use Accept: */* for RSC refetches. Force the
-  // expected RSC accept header so Next serves Flight payloads instead of HTML.
-  if (req.headers['rsc'] === '1') {
-    if (!req.headers.accept || req.headers.accept === '*/*') {
-      req.headers.accept = 'text/x-component';
-    }
-    // Forwarded action redirects can inherit POST content-type on GET.
-    if (req.method === 'GET' && typeof req.headers['content-type'] === 'string') {
-      delete req.headers['content-type'];
-    }
-  }
-
-  try {
-    await prepareActionRequestBodyForBun(req);
-    await handle(req, res);
-  } catch (err) {
-    console.error('[adapter-bun] error handling request:', err);
-    if (!res.headersSent) {
-      res.writeHead(500, { 'content-type': 'text/plain' });
-    }
-    res.end('Internal Server Error');
-  }
-});
-
-const backendOrigin = await new Promise((resolve, reject) => {
-  const handleError = (error) => {
-    backendServer.off('listening', handleListening);
-    reject(error);
-  };
-
-  const handleListening = () => {
-    backendServer.off('error', handleError);
-    const addr = backendServer.address();
-    if (!addr || typeof addr === 'string') {
-      reject(new Error('[adapter-bun] failed to resolve Next.js backend address'));
-      return;
-    }
-    resolve('http://127.0.0.1:' + addr.port);
-  };
-
-  backendServer.once('error', handleError);
-  backendServer.listen(0, '127.0.0.1', handleListening);
-});
-
-async function proxyToNext(request, server) {
-  const requestUrl = new URL(request.url);
-  const targetUrl = new URL(requestUrl.pathname + requestUrl.search, backendOrigin);
-
-  const response = await fetch(targetUrl, {
-    method: request.method,
-    headers: buildProxyHeaders(request, server),
-    body: shouldProxyRequestBody(request.method) ? request.body : undefined,
-    redirect: 'manual',
-    signal: request.signal,
-  });
-
-  return sanitizeProxyResponse(response, request);
-}
-
-const server = Bun.serve({
-  port,
-  hostname: listenHostname,
-  fetch(request, bunServer) {
-    const trailingSlashRedirect = maybeHandleTrailingSlashRedirect(request);
-    if (trailingSlashRedirect) {
-      return trailingSlashRedirect;
-    }
-
-    const resolvedStaticAsset = getStaticAsset(request);
-    if (resolvedStaticAsset) {
-      const canonicalPathname = getCanonicalStaticAssetPathname(resolvedStaticAsset.asset);
-      if (
-        isHtmlStaticAsset(resolvedStaticAsset.asset) &&
-        resolvedStaticAsset.pathname !== canonicalPathname
-      ) {
-        return createRedirectResponse(request, new URL(request.url), canonicalPathname);
-      }
-
-      return serveStaticAsset(request, resolvedStaticAsset.asset);
-    }
-
-    bunServer.timeout(request, 0);
-    return proxyToNext(request, bunServer);
-  },
-  error(error) {
-    console.error('[adapter-bun] error handling request:', error);
-    return new Response('Internal Server Error', {
-      status: 500,
-      headers: {
-        'content-type': 'text/plain',
-      },
-    });
-  },
-});
-
-const handleListening = () => {
-  console.log(
-    \`\\n  Next.js (\\x1b[36m\${manifest.build.nextVersion}\\x1b[0m) \\x1b[2m|\\x1b[0m adapter-bun\\n\` +
-    \`  Listening on http://\${listenHostname}:\${port}\\n\` +
-    \`  Build ID: \${manifest.build.buildId}\\n\` +
-    \`  Static assets: \${staticAssetFastPathEnabled ? 'Bun.serve fast path enabled' : 'proxied through Next.js'}\\n\`
-  );
-};
-
-handleListening();
 `;
 
 async function writeServerEntry(outDir: string): Promise<void> {
@@ -819,9 +270,24 @@ async function copyRuntimeModule(
   );
 }
 
+async function copyExternalRuntimeModule(
+  outDir: string,
+  sourcePath: string,
+  outputName: string
+): Promise<void> {
+  const destDir = path.join(outDir, 'runtime');
+  await mkdir(destDir, { recursive: true });
+  await Bun.write(path.join(destDir, outputName), Bun.file(sourcePath));
+}
+
 async function stageRuntimeModules(outDir: string): Promise<void> {
   await Promise.all(
-    CACHE_RUNTIME_MODULES.map((mod) => copyRuntimeModule(outDir, mod))
+    [
+      ...CACHE_RUNTIME_MODULES.map((mod) => copyRuntimeModule(outDir, mod)),
+      ...EXTERNAL_RUNTIME_MODULES.map((mod) =>
+        copyExternalRuntimeModule(outDir, mod.sourcePath, mod.outputName)
+      ),
+    ]
   );
 }
 
@@ -1014,6 +480,7 @@ async function onBuildComplete(
 
   const generatedAt = new Date().toISOString();
   const pathnames = collectOutputPathnames(ctx.outputs);
+  const prerenderedPathnames = collectPrerenderedPathnames(ctx.outputs);
 
   const staticAssets = await stageStaticAssets({
     outputs: ctx.outputs,
@@ -1025,7 +492,9 @@ async function onBuildComplete(
   const port = options.port ?? DEFAULT_PORT;
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
   const previewProps = await readPreviewProps(ctx);
-  const routing = readRuntimeRoutingInfo(ctx);
+  const middleware = serializeMiddlewareOutput(ctx);
+  const routeOutputs = serializeRouteOutputs(ctx);
+  const prerenderArtifacts = serializePrerenderOutputs(ctx);
 
   const deploymentManifest = buildDeploymentManifest({
     adapterName: ADAPTER_NAME,
@@ -1033,11 +502,15 @@ async function onBuildComplete(
     ctx,
     generatedAt,
     pathnames,
+    prerenderedPathnames,
+    prerenderArtifacts,
     staticAssets,
     port,
     hostname,
+    routeOutputs,
+    routeGraph: ctx.routing,
+    middleware,
     previewProps,
-    routing,
   });
 
   await writeJsonFile(
@@ -1086,30 +559,34 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
       // Inject SQLite-backed handlers for both Next.js cache APIs:
       // 1) nextConfig.cacheHandler (IncrementalCache handler class)
       // 2) nextConfig.cacheHandlers.default/remote (cacheComponents handlers)
-      const existingCacheHandlers = configRecord.cacheHandlers as
+  const existingCacheHandlers = configRecord.cacheHandlers as
         | Record<string, string | undefined>
         | undefined;
 
-      // Stage the cache handler runtime into the output dir so the path is
-      // inside the project tree (Turbopack rejects absolute paths that leave
-      // the project root). The files are small and this is idempotent.
-      const runtimeDir = path.resolve(configuredOutDir, 'runtime');
-      if (!existsSync(runtimeDir)) {
-        mkdirSync(runtimeDir, { recursive: true });
+      const distDirName =
+        typeof config.distDir === 'string' && config.distDir.length > 0
+          ? config.distDir
+          : '.next';
+
+      // Stage cache handler modules into the build dist tree so both Node and
+      // edge output bundles can import them during compilation/runtime.
+      const buildRuntimeDir = path.resolve(distDirName, 'adapter-bun-runtime');
+      if (!existsSync(buildRuntimeDir)) {
+        mkdirSync(buildRuntimeDir, { recursive: true });
       }
       const sourceDir = path.join(import.meta.dirname, 'runtime');
       for (const mod of CACHE_RUNTIME_MODULES) {
-        const dest = path.join(runtimeDir, mod);
+        const dest = path.join(buildRuntimeDir, mod);
         copyFileSync(path.join(sourceDir, mod), dest);
       }
       const useCacheHandlerPath = path.resolve(
-        configuredOutDir,
-        'runtime',
+        distDirName,
+        'adapter-bun-runtime',
         'cache-handler.js'
       );
       const incrementalCacheHandlerPath = path.resolve(
-        configuredOutDir,
-        'runtime',
+        distDirName,
+        'adapter-bun-runtime',
         'incremental-cache-handler.js'
       );
 

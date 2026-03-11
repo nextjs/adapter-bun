@@ -198,6 +198,20 @@ function isExtensionlessRoutePathname(pathname: string): boolean {
   return path.posix.extname(lastSegment) === '';
 }
 
+function flattenHeaders(
+  headers: Record<string, string | string[]> | undefined
+): Record<string, string> | undefined {
+  if (!headers) {
+    return undefined;
+  }
+
+  const flattened: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    flattened[key] = Array.isArray(value) ? value.join(', ') : value;
+  }
+  return flattened;
+}
+
 export async function stageStaticAssets({
   outputs,
   projectDir,
@@ -230,6 +244,7 @@ export async function stageStaticAssets({
       sourcePath: output.filePath,
       stagedPath,
       objectKey,
+      status: 200,
       contentType:
         path.extname(output.filePath) === '.html' &&
         isExtensionlessRoutePathname(output.pathname)
@@ -239,6 +254,48 @@ export async function stageStaticAssets({
         pathname: output.pathname,
         sourcePath: output.filePath,
       }),
+    });
+  }
+
+  for (const output of sortByPathnameAndId(outputs.prerenders).filter(
+    (entry) => typeof entry.fallback?.filePath === 'string' && entry.fallback.filePath.length > 0
+  )) {
+    const sourcePath = output.fallback!.filePath!;
+    const objectKey = buildStaticObjectKey(output.pathname, sourcePath);
+    recordByObjectKey(seenByObjectKey, objectKey, sourcePath);
+
+    const stagedPath = path.posix.join('static', objectKey);
+    await copyToOutDir({
+      sourcePath,
+      outDir,
+      relativePath: stagedPath,
+    });
+
+    const headers = flattenHeaders(output.fallback?.initialHeaders);
+    const contentType =
+      headers?.['content-type'] ??
+      (path.extname(sourcePath) === '.html' &&
+      isExtensionlessRoutePathname(output.pathname)
+        ? 'text/html; charset=utf-8'
+        : null);
+    const cacheControl =
+      headers?.['cache-control'] ??
+      resolveStaticAssetCacheControl({
+        pathname: output.pathname,
+        sourcePath,
+      });
+
+    assets.push({
+      id: output.id,
+      pathname: output.pathname,
+      sourceType: 'prerender',
+      sourcePath,
+      stagedPath,
+      objectKey,
+      status: output.fallback?.initialStatus ?? 200,
+      headers,
+      contentType,
+      cacheControl,
     });
   }
 
@@ -268,6 +325,7 @@ export async function stageStaticAssets({
         sourcePath: publicFilePath,
         stagedPath,
         objectKey,
+        status: 200,
         contentType: null,
         cacheControl: null,
       });

@@ -1,5 +1,9 @@
 import type {
   BunDeploymentManifest,
+  BunMiddlewareArtifact,
+  BunPrerenderArtifact,
+  BunRouteGraph,
+  BunRouteArtifact,
   BunStaticAsset,
   BuildCompleteContext,
 } from './types.ts';
@@ -31,34 +35,50 @@ export function collectOutputPathnames(
   return [...pathnames].sort((a, b) => a.localeCompare(b));
 }
 
+export function collectPrerenderedPathnames(
+  outputs: BuildCompleteContext['outputs']
+): string[] {
+  const pathnames = new Set<string>();
+
+  for (const output of [...outputs.prerenders, ...outputs.staticFiles]) {
+    pathnames.add(output.pathname);
+  }
+
+  return [...pathnames].sort((a, b) => a.localeCompare(b));
+}
+
 export function buildDeploymentManifest({
   adapterName,
   adapterOutDir,
   ctx,
   generatedAt,
   pathnames,
+  prerenderedPathnames,
+  prerenderArtifacts,
   staticAssets,
   port,
   hostname,
+  routeOutputs,
+  routeGraph,
+  middleware,
   previewProps,
-  routing,
 }: {
   adapterName: string;
   adapterOutDir: string;
   ctx: BuildCompleteContext;
   generatedAt: string;
   pathnames: string[];
+  prerenderedPathnames: string[];
+  prerenderArtifacts: BunPrerenderArtifact[];
   staticAssets: BunStaticAsset[];
   port: number;
   hostname: string;
+  routeOutputs: BunRouteArtifact[];
+  routeGraph: BunRouteGraph;
+  middleware?: BunMiddlewareArtifact | null;
   previewProps?: BunDeploymentManifest['runtime'] extends infer Runtime
     ? Runtime extends { previewProps?: infer Preview }
       ? Preview
-      : never
-    : never;
-  routing?: BunDeploymentManifest['runtime'] extends infer Runtime
-    ? Runtime extends { routing?: infer Routing }
-      ? Routing
       : never
     : never;
 }): BunDeploymentManifest {
@@ -84,13 +104,13 @@ export function buildDeploymentManifest({
       hostname,
     },
     pathnames,
+    prerenderedPathnames,
+    prerenderArtifacts,
+    routeOutputs,
+    routeGraph,
+    middleware: middleware ?? null,
     runtime: {
       previewProps: previewProps ?? null,
-      routing: routing ?? {
-        hasMiddleware: false,
-        hasBeforeFilesRewrites: false,
-        staticAssetFastPathEnabled: false,
-      },
     },
     staticAssets,
     summary: {
