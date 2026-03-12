@@ -301,6 +301,15 @@ function resolveRedirectLocationWithPreservedSearch({
     return location;
   }
 
+  const normalizePathname = (value: string): string =>
+    value.length > 1 && value.endsWith('/') ? value.slice(0, -1) : value;
+  if (
+    normalizePathname(redirectedUrl.pathname) !==
+    normalizePathname(requestUrl.pathname)
+  ) {
+    return location;
+  }
+
   redirectedUrl.search = requestUrl.search;
   if (location.startsWith('/')) {
     return `${redirectedUrl.pathname}${redirectedUrl.search}${redirectedUrl.hash}`;
@@ -320,7 +329,7 @@ function resolveRouteOutputModulePath(
   output: BunRouteArtifact
 ): string {
   const normalizedSourcePage = output.sourcePage.replace(/^\/+/, '');
-  const candidatePaths: string[] = [];
+  const candidatePaths: string[] = [path.join(runtimeDistDir, output.filePath)];
 
   switch (output.type) {
     case 'APP_PAGE':
@@ -344,6 +353,16 @@ function resolveRouteOutputModulePath(
       candidatePaths.push(
         path.join(runtimeDistDir, 'server', 'pages', `${pagePath}.js`)
       );
+      if (pagePath.endsWith('/index')) {
+        candidatePaths.push(
+          path.join(
+            runtimeDistDir,
+            'server',
+            'pages',
+            `${pagePath.slice(0, -'/index'.length)}.js`
+          )
+        );
+      }
       break;
     }
     default:
@@ -583,24 +602,13 @@ function maybeResolveNextDataMatchedPathname({
   staticAssetsByPathname: Map<string, BunDeploymentManifest['staticAssets'][number]>;
 }): string | null {
   const requestUrl = new URL(request.url);
-  const basePath =
-    manifest.build.basePath && manifest.build.basePath !== '/'
-      ? manifest.build.basePath
-      : '';
-  const dataPrefix = `${basePath}/_next/data/${manifest.build.buildId}/`;
-
-  if (
-    !requestUrl.pathname.startsWith(dataPrefix) ||
-    !requestUrl.pathname.endsWith('.json')
-  ) {
+  const resolvedPathname = resolvePagePathnameFromNextDataPathname(
+    requestUrl.pathname,
+    manifest
+  );
+  if (!resolvedPathname) {
     return null;
   }
-
-  let pathname = requestUrl.pathname.slice(dataPrefix.length, -'.json'.length);
-  pathname = pathname === 'index' ? '' : pathname.replace(/\/index$/, '');
-
-  const resolvedPathname =
-    `${basePath}/${pathname}`.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
   if (
     routeOutputsByPathname.has(resolvedPathname) ||
     staticAssetsByPathname.has(resolvedPathname)
@@ -609,6 +617,193 @@ function maybeResolveNextDataMatchedPathname({
   }
 
   return null;
+}
+
+function isNextDataRequestPath({
+  request,
+  manifest,
+}: {
+  request: Request;
+  manifest: BunDeploymentManifest;
+}): boolean {
+  return (
+    request.headers.get('x-nextjs-data') === '1' ||
+    isNextDataPathname(new URL(request.url).pathname, manifest)
+  );
+}
+
+function getNextDataPathPrefix(manifest: BunDeploymentManifest): string {
+  const basePath =
+    manifest.build.basePath && manifest.build.basePath !== '/'
+      ? manifest.build.basePath
+      : '';
+  return `${basePath}/_next/data/${manifest.build.buildId}/`;
+}
+
+function isNextDataPathname(
+  pathname: string,
+  manifest: BunDeploymentManifest
+): boolean {
+  const dataPrefix = getNextDataPathPrefix(manifest);
+  return pathname.startsWith(dataPrefix) && pathname.endsWith('.json');
+}
+
+function resolvePagePathnameFromNextDataPathname(
+  pathname: string,
+  manifest: BunDeploymentManifest
+): string | null {
+  if (!isNextDataPathname(pathname, manifest)) {
+    return null;
+  }
+
+  const dataPrefix = getNextDataPathPrefix(manifest);
+  const withoutPrefix = pathname.slice(dataPrefix.length, -'.json'.length);
+  let pagePathname =
+    withoutPrefix === 'index'
+      ? '/'
+      : `/${withoutPrefix}`.replace(/\/+/g, '/').replace(/\/index$/, '') || '/';
+  const basePath =
+    manifest.build.basePath && manifest.build.basePath !== '/'
+      ? manifest.build.basePath
+      : '';
+  if (basePath) {
+    pagePathname = pagePathname === '/' ? basePath : `${basePath}${pagePathname}`;
+  }
+  return pagePathname;
+}
+
+function resolveNextDataPathnameFromPagePathname(
+  pathname: string,
+  manifest: BunDeploymentManifest
+): string {
+  const dataPrefix = getNextDataPathPrefix(manifest);
+  const basePath =
+    manifest.build.basePath && manifest.build.basePath !== '/'
+      ? manifest.build.basePath
+      : '';
+  let normalizedPathname = pathname;
+  if (basePath && pathHasPrefix(normalizedPathname, basePath)) {
+    normalizedPathname = removePathPrefix(normalizedPathname, basePath);
+  }
+  if (normalizedPathname.length === 0 || normalizedPathname === '/') {
+    return `${dataPrefix}index.json`;
+  }
+  const withoutLeadingSlash = normalizedPathname.replace(/^\/+/, '');
+  return `${dataPrefix}${withoutLeadingSlash}.json`;
+}
+
+function resolveNextDataInvocationPathname({
+  requestPathname,
+  middlewareRewriteUrl,
+  requestedResolutionPathname,
+  upstreamRequestUrl,
+  manifest,
+}: {
+  requestPathname: string;
+  middlewareRewriteUrl: string | null;
+  requestedResolutionPathname: string | null;
+  upstreamRequestUrl: URL;
+  manifest: BunDeploymentManifest;
+}): string {
+  const requestIsNextDataPath = isNextDataPathname(requestPathname, manifest);
+  if (!requestIsNextDataPath) {
+    let targetPagePathname = requestPathname;
+    if (middlewareRewriteUrl) {
+      try {
+        targetPagePathname = new URL(
+          middlewareRewriteUrl,
+          upstreamRequestUrl
+        ).pathname;
+      } catch {
+        // Fall through to resolution/request path when rewrite URL cannot be parsed.
+      }
+    } else if (
+      requestedResolutionPathname &&
+      !requestedResolutionPathname.includes('[') &&
+      !hasInterceptionMarker(requestedResolutionPathname)
+    ) {
+      targetPagePathname = requestedResolutionPathname;
+    }
+    const normalizedTargetPagePathname =
+      targetPagePathname.length > 1 && targetPagePathname.endsWith('/')
+        ? targetPagePathname.slice(0, -1)
+        : targetPagePathname;
+    return resolveNextDataPathnameFromPagePathname(
+      normalizedTargetPagePathname,
+      manifest
+    );
+  }
+
+  if (!requestedResolutionPathname) {
+    return requestPathname;
+  }
+
+  if (middlewareRewriteUrl) {
+    try {
+      const rewritePathname = new URL(
+        middlewareRewriteUrl,
+        upstreamRequestUrl
+      ).pathname;
+      if (isNextDataPathname(rewritePathname, manifest)) {
+        return rewritePathname;
+      }
+    } catch {
+      // Fall through to request pathname when rewrite URL cannot be parsed.
+    }
+  }
+
+  return requestPathname;
+}
+
+function resolveCanonicalNextDataToPageRedirectUrl({
+  requestPathname,
+  resolution,
+  requestUrl,
+  manifest,
+}: {
+  requestPathname: string;
+  resolution: ResolveRoutesResult;
+  requestUrl: URL;
+  manifest: BunDeploymentManifest;
+}): URL | null {
+  if (!isNextDataPathname(requestPathname, manifest)) {
+    return null;
+  }
+
+  const requestPagePathname = resolvePagePathnameFromNextDataPathname(
+    requestPathname,
+    manifest
+  );
+  if (!requestPagePathname) {
+    return null;
+  }
+
+  const location =
+    resolution.redirect?.url.toString() ??
+    resolution.resolvedHeaders?.get('location') ??
+    null;
+  if (!location) {
+    return null;
+  }
+
+  let redirectUrl: URL;
+  try {
+    redirectUrl = new URL(location, requestUrl);
+  } catch {
+    return null;
+  }
+
+  const normalizePathname = (value: string): string =>
+    value.length > 1 && value.endsWith('/') ? value.slice(0, -1) : value;
+
+  if (
+    normalizePathname(redirectUrl.pathname) !==
+    normalizePathname(requestPagePathname)
+  ) {
+    return null;
+  }
+
+  return redirectUrl;
 }
 
 function normalizeIndexPathnameAlias(
@@ -724,34 +919,13 @@ function overwriteQueryObject(
   appendQueryObject(searchParams, query);
 }
 
-function appendSearchParams(
-  target: URLSearchParams,
-  source: URLSearchParams
-): void {
-  for (const [key, value] of source.entries()) {
-    target.append(key, value);
-  }
-}
-
-function overwriteSearchParams(
-  target: URLSearchParams,
-  source: URLSearchParams
-): void {
-  const keys = new Set<string>();
-  for (const [key] of source.entries()) {
-    keys.add(key);
-  }
-  for (const key of keys) {
-    target.delete(key);
-  }
-  appendSearchParams(target, source);
-}
-
 function extractRouteGraphDestinationQuery({
   requestUrl,
+  requestHeaders,
   routeGraph,
 }: {
   requestUrl: URL;
+  requestHeaders: Headers;
   routeGraph: BunDeploymentManifest['routeGraph'];
 }): QueryObject {
   const query: QueryObject = {};
@@ -776,13 +950,28 @@ function extractRouteGraphDestinationQuery({
         Array.isArray((route as { has?: unknown[] }).has) &&
         ((route as { has?: unknown[] }).has?.length ?? 0) > 0
       ) {
-        continue;
+        const hasConditions = (route as { has?: MiddlewareMatcherCondition[] })
+          .has!;
+        const hasMatched = hasConditions.every((condition) =>
+          matcherConditionSatisfied(condition, requestUrl, requestHeaders)
+        );
+        if (!hasMatched) {
+          continue;
+        }
       }
       if (
         Array.isArray((route as { missing?: unknown[] }).missing) &&
         ((route as { missing?: unknown[] }).missing?.length ?? 0) > 0
       ) {
-        continue;
+        const missingConditions = (
+          route as { missing?: MiddlewareMatcherCondition[] }
+        ).missing!;
+        const hasMissing = missingConditions.some((condition) =>
+          matcherConditionSatisfied(condition, requestUrl, requestHeaders)
+        );
+        if (hasMissing) {
+          continue;
+        }
       }
 
       let routePattern: RegExp;
@@ -831,6 +1020,117 @@ function extractRouteGraphDestinationQuery({
   }
 
   return query;
+}
+
+function extractRouteGraphDestinationPathname({
+  requestUrl,
+  requestHeaders,
+  routeGraph,
+  routeOutputsByPathname,
+  staticAssetsByPathname,
+  prerenderArtifactsByPathname,
+  basePath,
+}: {
+  requestUrl: URL;
+  requestHeaders: Headers;
+  routeGraph: BunDeploymentManifest['routeGraph'];
+  routeOutputsByPathname: Map<string, BunRouteArtifact>;
+  staticAssetsByPathname: Map<string, BunDeploymentManifest['staticAssets'][number]>;
+  prerenderArtifactsByPathname: Map<string, BunPrerenderArtifact>;
+  basePath: string;
+}): string | null {
+  const hasOutputPathname = (candidatePathname: string): boolean =>
+    routeOutputsByPathname.has(candidatePathname) ||
+    staticAssetsByPathname.has(candidatePathname) ||
+    prerenderArtifactsByPathname.has(candidatePathname);
+  const routeGroups = [
+    routeGraph.beforeFiles,
+    routeGraph.afterFiles,
+    routeGraph.fallback,
+  ];
+
+  for (const routes of routeGroups) {
+    for (const route of routes) {
+      if (
+        !route.destination ||
+        route.destination.length === 0 ||
+        route.status ||
+        route.destination.startsWith('http://') ||
+        route.destination.startsWith('https://')
+      ) {
+        continue;
+      }
+      if (
+        Array.isArray((route as { has?: unknown[] }).has) &&
+        ((route as { has?: unknown[] }).has?.length ?? 0) > 0
+      ) {
+        const hasConditions = (route as { has?: MiddlewareMatcherCondition[] })
+          .has!;
+        const hasMatched = hasConditions.every((condition) =>
+          matcherConditionSatisfied(condition, requestUrl, requestHeaders)
+        );
+        if (!hasMatched) {
+          continue;
+        }
+      }
+      if (
+        Array.isArray((route as { missing?: unknown[] }).missing) &&
+        ((route as { missing?: unknown[] }).missing?.length ?? 0) > 0
+      ) {
+        const missingConditions = (
+          route as { missing?: MiddlewareMatcherCondition[] }
+        ).missing!;
+        const hasMissing = missingConditions.some((condition) =>
+          matcherConditionSatisfied(condition, requestUrl, requestHeaders)
+        );
+        if (hasMissing) {
+          continue;
+        }
+      }
+
+      let routePattern: RegExp;
+      try {
+        routePattern = new RegExp(route.sourceRegex);
+      } catch {
+        continue;
+      }
+
+      const match = requestUrl.pathname.match(routePattern);
+      if (!match) {
+        continue;
+      }
+
+      let destination = route.destination;
+      for (let index = 1; index < match.length; index++) {
+        const value = match[index];
+        if (value === undefined) {
+          continue;
+        }
+        destination = destination.replace(new RegExp(`\\$${index}`, 'g'), value);
+      }
+      const groups =
+        (match as RegExpMatchArray & { groups?: Record<string, string> }).groups ??
+        undefined;
+      if (groups) {
+        for (const [key, value] of Object.entries(groups)) {
+          destination = destination.replace(new RegExp(`\\$${key}`, 'g'), value);
+        }
+      }
+
+      const destinationUrl = new URL(destination, requestUrl);
+      const lookupCandidates = getLookupPathnameCandidates(
+        destinationUrl.pathname,
+        basePath
+      );
+      for (const candidate of lookupCandidates) {
+        if (hasOutputPathname(candidate)) {
+          return candidate;
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 function toStringArray(value: unknown): string[] {
@@ -1079,6 +1379,30 @@ function routeMatchesToQueryObject(
   return query;
 }
 
+function routeParamsToQueryObject(
+  params?: Record<string, string | string[]>
+): QueryObject {
+  const query: QueryObject = {};
+  if (!params) {
+    return query;
+  }
+
+  const decodeParamValue = (value: string): string => {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  };
+
+  for (const [key, value] of Object.entries(params)) {
+    query[key] = Array.isArray(value)
+      ? value.map((entry) => decodeParamValue(entry))
+      : decodeParamValue(value);
+  }
+  return query;
+}
+
 function computeDjb2Hash(input: string): number {
   let hash = 5381;
   for (let i = 0; i < input.length; i++) {
@@ -1208,6 +1532,19 @@ function extractRouteParamsFromPathname(
   pathnameTemplate: string,
   concretePathname: string
 ): Record<string, string | string[]> | undefined {
+  const decodeParamSegment = (value: string): string => {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  };
+  const normalizeTemplateSegment = (segment: string): string => {
+    const withoutInterceptionMarker = normalizeRouteMatchValue(segment);
+    return withoutInterceptionMarker.endsWith('.rsc')
+      ? withoutInterceptionMarker.slice(0, -'.rsc'.length)
+      : withoutInterceptionMarker;
+  };
   const templateSegments = pathnameTemplate.split('/').filter(Boolean);
   const concreteSegments = concretePathname.split('/').filter(Boolean);
   const params: Record<string, string | string[]> = {};
@@ -1222,39 +1559,50 @@ function extractRouteParamsFromPathname(
     if (templateSegment === undefined) {
       return undefined;
     }
+    const normalizedTemplateSegment = normalizeTemplateSegment(templateSegment);
     const concreteSegment = concreteSegments[concreteIndex];
 
     if (
-      templateSegment.startsWith('[[...') &&
-      templateSegment.endsWith(']]')
+      normalizedTemplateSegment.startsWith('[[...') &&
+      normalizedTemplateSegment.endsWith(']]')
     ) {
-      const key = templateSegment.slice('[[...'.length, -']]'.length);
-      params[key] = concreteSegments.slice(concreteIndex);
+      const key = normalizedTemplateSegment.slice('[[...'.length, -']]'.length);
+      params[key] = concreteSegments
+        .slice(concreteIndex)
+        .map((segment) => decodeParamSegment(segment));
       concreteIndex = concreteSegments.length;
       break;
     }
 
-    if (templateSegment.startsWith('[...') && templateSegment.endsWith(']')) {
-      const key = templateSegment.slice('[...'.length, -']'.length);
+    if (
+      normalizedTemplateSegment.startsWith('[...') &&
+      normalizedTemplateSegment.endsWith(']')
+    ) {
+      const key = normalizedTemplateSegment.slice('[...'.length, -']'.length);
       if (concreteIndex >= concreteSegments.length) {
         return undefined;
       }
-      params[key] = concreteSegments.slice(concreteIndex);
+      params[key] = concreteSegments
+        .slice(concreteIndex)
+        .map((segment) => decodeParamSegment(segment));
       concreteIndex = concreteSegments.length;
       break;
     }
 
-    if (templateSegment.startsWith('[') && templateSegment.endsWith(']')) {
+    if (
+      normalizedTemplateSegment.startsWith('[') &&
+      normalizedTemplateSegment.endsWith(']')
+    ) {
       if (concreteSegment === undefined) {
         return undefined;
       }
-      const key = templateSegment.slice(1, -1);
-      params[key] = concreteSegment;
+      const key = normalizedTemplateSegment.slice(1, -1);
+      params[key] = decodeParamSegment(concreteSegment);
       concreteIndex += 1;
       continue;
     }
 
-    if (templateSegment !== concreteSegment) {
+    if (normalizedTemplateSegment !== concreteSegment) {
       return undefined;
     }
     concreteIndex += 1;
@@ -1299,7 +1647,34 @@ function getRequestUserAgent(request: Request): string {
 }
 
 function shouldForceConnectionClose(request: Request): boolean {
-  return getRequestUserAgent(request).includes('node-fetch');
+  const userAgent = getRequestUserAgent(request).toLowerCase();
+  return (
+    userAgent.includes('node-fetch') ||
+    userAgent.includes('googlebot') ||
+    userAgent.includes('google-pagerenderer')
+  );
+}
+
+function shouldBufferEdgeResponseForCrawler(request: Request): boolean {
+  const userAgent = getRequestUserAgent(request).toLowerCase();
+  return (
+    userAgent.includes('googlebot') ||
+    userAgent.includes('google-pagerenderer')
+  );
+}
+
+function isDocumentNavigationRequest(request: Request): boolean {
+  if (request.headers.get('upgrade-insecure-requests') === '1') {
+    return true;
+  }
+  if (
+    request.headers.get('sec-fetch-mode') === 'navigate' ||
+    request.headers.get('sec-fetch-dest') === 'document'
+  ) {
+    return true;
+  }
+  const accept = request.headers.get('accept')?.toLowerCase() ?? '';
+  return accept.includes('text/html');
 }
 
 function getForwardedPort(url: URL): string {
@@ -1341,12 +1716,76 @@ function buildProxyHeaders({
   return headers;
 }
 
+function normalizeNextJsRedirectHeaderValue(value: string): string {
+  const toPageRedirect = ({
+    pathname,
+    search,
+  }: {
+    pathname: string;
+    search: string;
+  }): string | null => {
+    const match = pathname.match(/^\/_next\/data\/[^/]+\/(.+)\.json$/);
+    if (!match) {
+      return null;
+    }
+
+    let pagePathname = `/${match[1]}`;
+    if (pagePathname === '/index') {
+      pagePathname = '/';
+    } else if (pagePathname.endsWith('/index')) {
+      pagePathname = pagePathname.slice(0, -'/index'.length) || '/';
+    }
+
+    return `${pagePathname}${search}`;
+  };
+
+  if (value.startsWith('/')) {
+    const relativeUrl = new URL(value, 'http://adapter-bun.local');
+    return (
+      toPageRedirect({
+        pathname: relativeUrl.pathname,
+        search: relativeUrl.search,
+      }) ?? value
+    );
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return value;
+  }
+
+  const normalizedPath = toPageRedirect({
+    pathname: parsed.pathname,
+    search: parsed.search,
+  });
+  if (!normalizedPath) {
+    return value;
+  }
+
+  return `${parsed.origin}${normalizedPath}`;
+}
+
 function sanitizeProxyResponse(response: Response, request: Request): Response {
   const headers = new Headers(response.headers);
   headers.delete('connection');
   headers.delete('keep-alive');
   headers.delete('transfer-encoding');
   headers.delete('x-next-cache-tags');
+  if (headers.get('x-nextjs-prerender') === '1') {
+    const nextJsCache = headers.get('x-nextjs-cache');
+    if (nextJsCache === null || nextJsCache === 'MISS') {
+      headers.set('x-nextjs-cache', 'HIT');
+    }
+  }
+  const nextJsRedirect = headers.get('x-nextjs-redirect');
+  if (nextJsRedirect) {
+    headers.set(
+      'x-nextjs-redirect',
+      normalizeNextJsRedirectHeaderValue(nextJsRedirect)
+    );
+  }
 
   if (shouldForceConnectionClose(request)) {
     headers.set('connection', 'close');
@@ -1359,6 +1798,21 @@ function sanitizeProxyResponse(response: Response, request: Request): Response {
   });
 }
 
+function normalizeEdgeResponseEncoding(response: Response): Response {
+  if (!response.headers.has('content-encoding')) {
+    return response;
+  }
+
+  const normalizedHeaders = new Headers(response.headers);
+  normalizedHeaders.delete('content-encoding');
+  normalizedHeaders.delete('content-length');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: normalizedHeaders,
+  });
+}
+
 function buildStaticAssetHeaders(
   file: Bun.BunFile,
   asset: BunDeploymentManifest['staticAssets'][number]
@@ -1366,6 +1820,8 @@ function buildStaticAssetHeaders(
   const headers = new Headers(asset.headers);
   if (asset.cacheControl) {
     headers.set('cache-control', asset.cacheControl);
+  } else if (shouldUseDefaultAppMetadataCacheControl(asset)) {
+    headers.set('cache-control', 'public, max-age=0, must-revalidate');
   }
   const contentType = asset.contentType || file.type;
   if (contentType) {
@@ -1377,6 +1833,19 @@ function buildStaticAssetHeaders(
   return headers;
 }
 
+function shouldUseDefaultAppMetadataCacheControl(
+  asset: BunDeploymentManifest['staticAssets'][number]
+): boolean {
+  if (asset.sourceType !== 'next-static') {
+    return false;
+  }
+  const normalizedSourcePath = asset.sourcePath.replaceAll('\\', '/');
+  return (
+    normalizedSourcePath.includes('/.next/server/app/') &&
+    normalizedSourcePath.endsWith('.body')
+  );
+}
+
 function serveStaticAsset(
   request: Request,
   adapterDir: string,
@@ -1385,8 +1854,11 @@ function serveStaticAsset(
 ): Response {
   const file = Bun.file(path.join(adapterDir, asset.stagedPath));
   const headers = buildStaticAssetHeaders(file, asset);
+  const isRscFallbackStaticAsset =
+    asset.sourceType === 'next-static' &&
+    asset.sourcePath.endsWith('rsc-fallback.json');
 
-  if (isRscStaticAssetPath(asset.pathname, routeGraph)) {
+  if (isRscStaticAssetPath(asset.pathname, routeGraph) && !isRscFallbackStaticAsset) {
     headers.set('content-type', 'text/x-component');
   }
   if (request.headers.get(routeGraph.rsc.header) === '1') {
@@ -1412,6 +1884,12 @@ function serveStaticAsset(
 
 function encodeRouteInvocationMeta(meta: RouteInvocationMeta): string {
   return Buffer.from(JSON.stringify(meta), 'utf8').toString('base64url');
+}
+
+function sanitizeIncomingRequestHeaders(headers: Headers): Headers {
+  const sanitized = new Headers(headers);
+  sanitized.delete('x-middleware-set-cookie');
+  return sanitized;
 }
 
 function decodeRouteInvocationMeta(value: string | undefined): RouteInvocationMeta | undefined {
@@ -1957,6 +2435,27 @@ function patchCacheControlHeader(
   }) as typeof res.writeHead;
 }
 
+function patchApiResponseDefaultContentType(res: http.ServerResponse): void {
+  if ((res as http.ServerResponse & { __adapterApiContentTypePatched?: boolean }).__adapterApiContentTypePatched) {
+    return;
+  }
+  (
+    res as http.ServerResponse & { __adapterApiContentTypePatched?: boolean }
+  ).__adapterApiContentTypePatched = true;
+
+  const originalEnd = res.end.bind(res);
+  res.end = ((chunk?: unknown, encoding?: unknown, cb?: unknown) => {
+    if (!res.headersSent && !res.hasHeader('content-type')) {
+      res.setHeader('content-type', 'text/plain; charset=utf-8');
+    }
+    return originalEnd(
+      chunk as Parameters<typeof originalEnd>[0],
+      encoding as Parameters<typeof originalEnd>[1],
+      cb as Parameters<typeof originalEnd>[2]
+    );
+  }) as typeof res.end;
+}
+
 async function loadRuntimeNextConfig(
   adapterDir: string,
   manifest: BunDeploymentManifest,
@@ -2228,11 +2727,101 @@ function hasLocalePrefix(
   );
 }
 
-function normalizePathnameForFallbackMatch(pathname: string): string {
-  if (pathname === '/') {
-    return pathname;
+function isPagesApiPathname(
+  pathname: string,
+  basePath: string
+): boolean {
+  const normalizedBasePath = normalizeBasePathPrefix(basePath);
+  const pathnameWithoutBasePath =
+    normalizedBasePath && pathHasPrefix(pathname, normalizedBasePath)
+      ? removePathPrefix(pathname, normalizedBasePath)
+      : pathname;
+  return (
+    pathnameWithoutBasePath === '/api' ||
+    pathnameWithoutBasePath.startsWith('/api/')
+  );
+}
+
+function normalizeRouteOutputForRuntime(
+  output: BunRouteArtifact,
+  basePath: string
+): BunRouteArtifact {
+  if (
+    output.type === 'PAGES_API' &&
+    !isPagesApiPathname(output.pathname, basePath)
+  ) {
+    return {
+      ...output,
+      type: 'PAGES' as BunRouteArtifact['type'],
+    };
   }
-  return pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+  return output;
+}
+
+function maybePrefixDefaultLocalePathname({
+  pathname,
+  basePath,
+  i18n,
+}: {
+  pathname: string;
+  basePath: string;
+  i18n: BunDeploymentManifest['build']['i18n'];
+}): string | null {
+  if (!i18n) {
+    return null;
+  }
+
+  let pathnameWithoutBasePath = pathname;
+  const normalizedBasePath = normalizeBasePathPrefix(basePath);
+  if (
+    normalizedBasePath &&
+    pathHasPrefix(pathnameWithoutBasePath, normalizedBasePath)
+  ) {
+    pathnameWithoutBasePath = removePathPrefix(
+      pathnameWithoutBasePath,
+      normalizedBasePath
+    );
+  }
+
+  if (hasLocalePrefix(pathnameWithoutBasePath, i18n)) {
+    return null;
+  }
+
+  const defaultLocalePathname =
+    pathnameWithoutBasePath === '/'
+      ? `/${i18n.defaultLocale}`
+      : `/${i18n.defaultLocale}${pathnameWithoutBasePath}`;
+
+  return withBasePath(defaultLocalePathname, basePath);
+}
+
+function decodePathnameSegmentsPreservingEncodedSlashes(
+  pathname: string
+): string {
+  return pathname
+    .split('/')
+    .map((segment) => {
+      if (segment.length === 0) {
+        return segment;
+      }
+      try {
+        return decodeURIComponent(segment).replaceAll('/', '%2F');
+      } catch {
+        return segment;
+      }
+    })
+    .join('/');
+}
+
+function normalizePathnameForFallbackMatch(pathname: string): string {
+  const decodedPathname = decodePathnameSegmentsPreservingEncodedSlashes(pathname);
+
+  if (decodedPathname === '/') {
+    return decodedPathname;
+  }
+  return decodedPathname.endsWith('/')
+    ? decodedPathname.slice(0, -1)
+    : decodedPathname;
 }
 
 function findDynamicOutputForPathname(
@@ -2339,19 +2928,37 @@ function getLookupPathnameCandidates(pathname: string, basePath: string): string
   return [pathname];
 }
 
+function getLocalePathnameCandidates(
+  pathname: string,
+  i18n: BunDeploymentManifest['build']['i18n']
+): string[] {
+  if (!i18n) {
+    return [pathname];
+  }
+
+  const localized = [pathname];
+  for (const locale of i18n.locales) {
+    localized.push(pathname === '/' ? `/${locale}` : `/${locale}${pathname}`);
+  }
+  return localized;
+}
+
 function resolveNotFoundRouteOutput(
   routeOutputsByPathname: Map<string, BunRouteArtifact>,
-  basePath: string
+  basePath: string,
+  i18n: BunDeploymentManifest['build']['i18n']
 ): BunRouteArtifact | undefined {
-  const candidates = ['/_not-found', '/404'];
+  const candidates = ['/_not-found', '/404', '/_error'];
   for (const candidate of candidates) {
-    for (const lookupPathname of getLookupPathnameCandidates(
-      candidate,
-      basePath
-    )) {
-      const routeOutput = routeOutputsByPathname.get(lookupPathname);
-      if (routeOutput) {
-        return routeOutput;
+    for (const localeCandidate of getLocalePathnameCandidates(candidate, i18n)) {
+      for (const lookupPathname of getLookupPathnameCandidates(
+        localeCandidate,
+        basePath
+      )) {
+        const routeOutput = routeOutputsByPathname.get(lookupPathname);
+        if (routeOutput) {
+          return routeOutput;
+        }
       }
     }
   }
@@ -2360,17 +2967,20 @@ function resolveNotFoundRouteOutput(
 
 function resolveServerErrorRouteOutput(
   routeOutputsByPathname: Map<string, BunRouteArtifact>,
-  basePath: string
+  basePath: string,
+  i18n: BunDeploymentManifest['build']['i18n']
 ): BunRouteArtifact | undefined {
   const candidates = ['/500', '/_error'];
   for (const candidate of candidates) {
-    for (const lookupPathname of getLookupPathnameCandidates(
-      candidate,
-      basePath
-    )) {
-      const routeOutput = routeOutputsByPathname.get(lookupPathname);
-      if (routeOutput) {
-        return routeOutput;
+    for (const localeCandidate of getLocalePathnameCandidates(candidate, i18n)) {
+      for (const lookupPathname of getLookupPathnameCandidates(
+        localeCandidate,
+        basePath
+      )) {
+        const routeOutput = routeOutputsByPathname.get(lookupPathname);
+        if (routeOutput) {
+          return routeOutput;
+        }
       }
     }
   }
@@ -2382,12 +2992,37 @@ function resolveNotFoundStaticAsset(
     string,
     BunDeploymentManifest['staticAssets'][number]
   >,
-  basePath: string
+  basePath: string,
+  i18n: BunDeploymentManifest['build']['i18n']
 ): BunDeploymentManifest['staticAssets'][number] | undefined {
   const candidates = ['/_not-found', '/404'];
   for (const candidate of candidates) {
+    for (const localeCandidate of getLocalePathnameCandidates(candidate, i18n)) {
+      for (const lookupPathname of getLookupPathnameCandidates(
+        localeCandidate,
+        basePath
+      )) {
+        const staticAsset = staticAssetsByPathname.get(lookupPathname);
+        if (staticAsset) {
+          return staticAsset;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+function resolveServerErrorStaticAsset(
+  staticAssetsByPathname: Map<
+    string,
+    BunDeploymentManifest['staticAssets'][number]
+  >,
+  basePath: string,
+  i18n: BunDeploymentManifest['build']['i18n']
+): BunDeploymentManifest['staticAssets'][number] | undefined {
+  for (const localeCandidate of getLocalePathnameCandidates('/500', i18n)) {
     for (const lookupPathname of getLookupPathnameCandidates(
-      candidate,
+      localeCandidate,
       basePath
     )) {
       const staticAsset = staticAssetsByPathname.get(lookupPathname);
@@ -2424,6 +3059,61 @@ function trimBasePath(pathname: string, basePath: string): string {
     return pathname;
   }
   return removePathPrefix(pathname, normalizedBasePath);
+}
+
+function resolveNextImageSourcePathname({
+  requestPathname,
+  searchParams,
+  basePath,
+}: {
+  requestPathname: string;
+  searchParams: URLSearchParams;
+  basePath: string;
+}): string | null {
+  const normalizedRequestPathname = trimBasePath(requestPathname, basePath);
+  if (normalizedRequestPathname !== '/_next/image') {
+    return null;
+  }
+
+  const sourceUrl = searchParams.get('url');
+  if (typeof sourceUrl !== 'string' || sourceUrl.length === 0) {
+    return null;
+  }
+  if (!sourceUrl.startsWith('/')) {
+    return null;
+  }
+
+  try {
+    return new URL(sourceUrl, 'http://adapter-bun.local').pathname;
+  } catch {
+    return sourceUrl;
+  }
+}
+
+function resolveStaticAssetForPathname({
+  pathname,
+  basePath,
+  staticAssetsByPathname,
+}: {
+  pathname: string;
+  basePath: string;
+  staticAssetsByPathname: Map<
+    string,
+    BunDeploymentManifest['staticAssets'][number]
+  >;
+}): BunDeploymentManifest['staticAssets'][number] | undefined {
+  const lookupCandidates = new Set<string>([
+    pathname,
+    trimBasePath(pathname, basePath),
+    withBasePath(pathname, basePath),
+  ]);
+  for (const candidate of lookupCandidates) {
+    const asset = staticAssetsByPathname.get(candidate);
+    if (asset) {
+      return asset;
+    }
+  }
+  return undefined;
 }
 
 function trimAssetPrefix(pathname: string, assetPrefix: unknown): string {
@@ -2497,6 +3187,15 @@ function getLiteralStatusOverride({
   }
 
   return null;
+}
+
+function hasMalformedPathnameEncoding(pathname: string): boolean {
+  try {
+    decodeURIComponent(pathname);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 export async function startServer(options?: StartServerOptions): Promise<void> {
@@ -2573,11 +3272,14 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
   const projectRequire = createRequire(path.join(projectDir, 'package.json'));
 
   const routeGraph = manifest.routeGraph;
-  const routeOutputsById = new Map(manifest.routeOutputs.map((output) => [output.id, output]));
-  const routeOutputsByPathname = new Map(
-    manifest.routeOutputs.map((output) => [output.pathname, output])
+  const routeOutputs = manifest.routeOutputs.map((output) =>
+    normalizeRouteOutputForRuntime(output, manifest.build.basePath)
   );
-  const appRouteOutputs = manifest.routeOutputs.filter(isAppRouteOutput);
+  const routeOutputsById = new Map(routeOutputs.map((output) => [output.id, output]));
+  const routeOutputsByPathname = new Map(
+    routeOutputs.map((output) => [output.pathname, output])
+  );
+  const appRouteOutputs = routeOutputs.filter(isAppRouteOutput);
   const prerenderArtifactsByPathname = new Map(
     (manifest.prerenderArtifacts ?? []).map((artifact) => [artifact.pathname, artifact])
   );
@@ -2590,11 +3292,18 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
   );
   const notFoundRouteOutput = resolveNotFoundRouteOutput(
     routeOutputsByPathname,
-    manifest.build.basePath
+    manifest.build.basePath,
+    manifest.build.i18n
+  );
+  const serverErrorStaticAsset = resolveServerErrorStaticAsset(
+    staticAssetsByPathname,
+    manifest.build.basePath,
+    manifest.build.i18n
   );
   const serverErrorRouteOutput = resolveServerErrorRouteOutput(
     routeOutputsByPathname,
-    manifest.build.basePath
+    manifest.build.basePath,
+    manifest.build.i18n
   );
 
   const nodeRouteHandlerCache = new Map<string, Promise<NodeRouteHandler>>();
@@ -2882,12 +3591,29 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
     routeOutput: BunRouteArtifact;
     invocationMeta?: RouteInvocationMeta;
   }): JsonRecord {
+    const requestHasNextDataHeader =
+      getSingleHeaderValue(req.headers['x-nextjs-data']) === '1';
+    const isNextDataReq =
+      requestHasNextDataHeader || requestUrl.pathname.includes('/_next/data/');
     const initUrl = invocationMeta?.originalUrl
       ? new URL(invocationMeta.originalUrl)
       : requestUrl;
+    const nextDataPagePathname = resolvePagePathnameFromNextDataPathname(
+      requestUrl.pathname,
+      manifest
+    );
+    const extractedPathParams =
+      extractRouteParamsFromPathname(routeOutput.pathname, requestUrl.pathname) ??
+      (nextDataPagePathname
+        ? extractRouteParamsFromPathname(routeOutput.pathname, nextDataPagePathname) ??
+          extractRouteParamsFromPathname(
+            routeOutput.pathname,
+            stripLocaleFromPathname(nextDataPagePathname, manifest.build.i18n)
+          )
+        : undefined);
     const extractedParams = mergeRouteParams(
-      extractRouteParamsFromPathname(routeOutput.pathname, requestUrl.pathname),
-      normalizeRouteParams(routeOutput.pathname, invocationMeta?.routeMatches)
+      normalizeRouteParams(routeOutput.pathname, invocationMeta?.routeMatches),
+      extractedPathParams
     );
 
     return {
@@ -2904,9 +3630,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       ...(req.headers[routeGraph.rsc.prefetchHeader] === '1'
         ? { isPrefetchRSCRequest: true }
         : {}),
-      ...(requestUrl.pathname.includes('/_next/data/')
-        ? { isNextDataReq: true }
-        : {}),
+      ...(isNextDataReq ? { isNextDataReq: true } : {}),
       ...(!routeOutput.pathname.includes('[') &&
       !hasInterceptionMarker(routeOutput.pathname) &&
       routeOutput.pathname !== requestUrl.pathname
@@ -2939,6 +3663,20 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       routeOutput,
       invocationMeta,
     });
+    if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1') {
+      console.error('[adapter-bun] node request meta', {
+        outputPathname: routeOutput.pathname,
+        url: requestUrl.pathname,
+        params:
+          typeof requestMeta.params === 'object' && requestMeta.params !== null
+            ? requestMeta.params
+            : null,
+        query:
+          typeof requestMeta.query === 'object' && requestMeta.query !== null
+            ? requestMeta.query
+            : null,
+      });
+    }
 
     const maybeResult = await handler(req, res, {
       waitUntil: (promise) => {
@@ -2986,6 +3724,36 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
     invocationMeta?: RouteInvocationMeta;
     currentOutputPathname?: string;
   }): Promise<boolean> {
+    if (
+      statusCode === 500 &&
+      serverErrorStaticAsset &&
+      serverErrorStaticAsset.pathname !== currentOutputPathname
+    ) {
+      try {
+        const staticAssetRequest = new Request(getNodeRequestUrl(req).toString(), {
+          method: req.method ?? 'GET',
+          headers: toResponseHeaders(req.headers),
+        });
+        const staticAssetResponse = serveStaticAsset(
+          staticAssetRequest,
+          adapterDir,
+          serverErrorStaticAsset,
+          routeGraph
+        );
+        const statusResponse = new Response(staticAssetResponse.body, {
+          status: 500,
+          headers: staticAssetResponse.headers,
+        });
+        await writeResponseToNode(res, statusResponse);
+        return true;
+      } catch (error) {
+        console.error(
+          `[adapter-bun] failed to render ${statusCode} fallback static asset "${serverErrorStaticAsset.pathname}":`,
+          error
+        );
+      }
+    }
+
     const routeOutput =
       statusCode === 404 ? notFoundRouteOutput : serverErrorRouteOutput;
 
@@ -3135,6 +3903,9 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           `[adapter-bun] missing node route output for "${resolvedInternalOutputPathname}"`
         );
       }
+      if (routeOutput.type === 'PAGES_API') {
+        patchApiResponseDefaultContentType(res);
+      }
 
       invocationMeta = decodeRouteInvocationMeta(
         getSingleHeaderValue(req.headers['x-bun-invoke-meta'])
@@ -3146,6 +3917,9 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           outputPathname: resolvedInternalOutputPathname,
           url: req.url,
           rsc: req.headers[routeGraph.rsc.header] ?? null,
+          nextJsData: req.headers['x-nextjs-data'] ?? null,
+          middlewarePrefetch: req.headers['x-middleware-prefetch'] ?? null,
+          purpose: req.headers.purpose ?? null,
           accept: req.headers.accept ?? null,
           nextRouterStateTree: req.headers['next-router-state-tree'] ?? null,
           nextRouterPrefetch: req.headers['next-router-prefetch'] ?? null,
@@ -3226,7 +4000,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       proxyHeaders.set(key, value);
     });
 
-    const response = await fetch(upstreamUrl, {
+    let response = await fetch(upstreamUrl, {
       method: request.method,
       headers: proxyHeaders,
       body: shouldSendRequestBody(request.method) ? request.body : undefined,
@@ -3234,21 +4008,50 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       signal: request.signal,
     });
 
+    const outputPathname = extraHeaders?.get('x-bun-output-pathname') ?? null;
+    const output = outputPathname
+      ? routeOutputsByPathname.get(outputPathname)
+      : undefined;
+    if (output?.runtime === 'edge') {
+      response = normalizeEdgeResponseEncoding(response);
+    }
+    const isApiOutput = output?.type === 'PAGES_API';
+    const isDocumentNavigation =
+      request.headers.get('upgrade-insecure-requests') === '1';
+    const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+    if (
+      isApiOutput &&
+      isDocumentNavigation &&
+      (contentType.length === 0 || contentType.startsWith('application/octet-stream'))
+    ) {
+      const normalizedHeaders = new Headers(response.headers);
+      normalizedHeaders.set('content-type', 'text/plain; charset=utf-8');
+      response = new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: normalizedHeaders,
+      });
+    }
+
+    const resolvedResponse = applyResolutionToResponse(response, resolution);
+
     if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1') {
       console.error('[adapter-bun] proxy response', {
         requestPathname: new URL(request.url).pathname,
         upstreamPathname: upstreamUrl.pathname,
-        status: response.status,
-        contentType: response.headers.get('content-type'),
+        status: resolvedResponse.status,
+        contentType: resolvedResponse.headers.get('content-type'),
+        xNextjsRewrite: resolvedResponse.headers.get('x-nextjs-rewrite'),
+        xMiddlewareRewrite: resolvedResponse.headers.get('x-middleware-rewrite'),
+        xNextjsMatchedPath: resolvedResponse.headers.get('x-nextjs-matched-path'),
         rscHeader: request.headers.get(routeGraph.rsc.header),
         outputPathname: extraHeaders?.get('x-bun-output-pathname') ?? null,
+        outputType: output?.type ?? null,
+        isDocumentNavigation,
       });
     }
 
-    return sanitizeProxyResponse(
-      applyResolutionToResponse(response, resolution),
-      request
-    );
+    return sanitizeProxyResponse(resolvedResponse, request);
   }
 
   async function canResolvePathnameWithoutMiddleware({
@@ -3300,11 +4103,30 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         );
       }
 
+      const requestUrl = new URL(request.url);
+      if (hasMalformedPathnameEncoding(requestUrl.pathname)) {
+        return sanitizeProxyResponse(
+          new Response('Bad Request', {
+            status: 400,
+            headers: {
+              'cache-control':
+                'private, no-cache, no-store, max-age=0, must-revalidate',
+              'content-type': 'text/plain; charset=utf-8',
+            },
+          }),
+          request
+        );
+      }
+
       const requestForResolution = shouldSendRequestBody(request.method)
         ? request.clone()
         : request;
+      const sanitizedRequestHeaders = sanitizeIncomingRequestHeaders(
+        request.headers
+      );
       let middlewareRequestHeaders: Headers | null = null;
       let middlewareRewriteUrl: string | null = null;
+      let middlewareResponseHeaders: unknown = null;
       let middlewareResponsePayload: Response | null = null;
 
       const invokeResolutionMiddleware = async ({
@@ -3324,7 +4146,19 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           return {};
         }
 
-        const middlewareRequest = new Request(url.toString(), {
+        const middlewareUrl = new URL(url.toString());
+        if (
+          headers.get('x-nextjs-data') === '1' &&
+          manifest.build.trailingSlash &&
+          middlewareUrl.pathname !== '/' &&
+          !middlewareUrl.pathname.endsWith('/') &&
+          !middlewareUrl.pathname.startsWith('/_next/') &&
+          !path.extname(middlewareUrl.pathname)
+        ) {
+          middlewareUrl.pathname = `${middlewareUrl.pathname}/`;
+        }
+
+        const middlewareRequest = new Request(middlewareUrl.toString(), {
           method: request.method,
           headers: new Headers(headers),
           body: shouldSendRequestBody(request.method) ? requestBody : undefined,
@@ -3341,7 +4175,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           signal: request.signal,
           requestMeta: {
             source: 'middleware',
-            pathname: url.pathname,
+            pathname: middlewareUrl.pathname,
           },
         });
 
@@ -3349,13 +4183,16 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         const middlewareResolved = responseToMiddlewareResult(
           middlewareResponse,
           new Headers(headers),
-          url
+          middlewareUrl
         );
         if (middlewareResolved.bodySent) {
           middlewareResponsePayload = middlewareResponse;
         }
         if (middlewareResolved.requestHeaders) {
           middlewareRequestHeaders = new Headers(middlewareResolved.requestHeaders);
+        }
+        if (middlewareResolved.responseHeaders) {
+          middlewareResponseHeaders = new Headers(middlewareResolved.responseHeaders);
         }
         if (middlewareResolved.rewrite) {
           middlewareRewriteUrl = middlewareResolved.rewrite.toString();
@@ -3368,7 +4205,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         buildId: manifest.build.buildId,
         basePath: manifest.build.basePath,
         requestBody: requestForResolution.body ?? createEmptyBodyStream(),
-        headers: new Headers([...requestForResolution.headers.entries()]),
+        headers: new Headers(sanitizedRequestHeaders),
         pathnames: manifest.pathnames,
         i18n: toResolutionI18nConfig(manifest),
         routes: routeGraph,
@@ -3416,7 +4253,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
             buildId: manifest.build.buildId,
             basePath: manifest.build.basePath,
             requestBody: createEmptyBodyStream(),
-            headers: new Headers([...requestForResolution.headers.entries()]),
+            headers: new Headers(sanitizedRequestHeaders),
             pathnames: manifest.pathnames,
             i18n: toResolutionI18nConfig(manifest),
             routes: routeGraph,
@@ -3455,7 +4292,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           buildId: manifest.build.buildId,
           basePath: manifest.build.basePath,
           requestBody: createEmptyBodyStream(),
-          headers: new Headers([...requestForResolution.headers.entries()]),
+          headers: new Headers(sanitizedRequestHeaders),
           pathnames: manifest.pathnames,
           i18n: {
             ...resolutionI18nConfig,
@@ -3477,6 +4314,52 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           unresolvedResolution = localeStableUnresolvedResolution;
           resolution = localeStableResolution;
         }
+      }
+
+      if (middlewareResponseHeaders instanceof Headers) {
+        const mergedResolvedHeaders = new Headers(
+          resolution.resolvedHeaders ?? undefined
+        );
+        middlewareResponseHeaders.forEach((value, key) => {
+          if (key.toLowerCase() === 'x-middleware-set-cookie') {
+            mergedResolvedHeaders.append(key, value);
+          } else {
+            mergedResolvedHeaders.set(key, value);
+          }
+        });
+        resolution = {
+          ...resolution,
+          resolvedHeaders: mergedResolvedHeaders,
+        };
+      }
+
+      const requestForResolutionUrl = new URL(requestForResolution.url);
+      const canonicalNextDataRedirectUrl =
+        resolveCanonicalNextDataToPageRedirectUrl({
+          requestPathname: requestForResolutionUrl.pathname,
+          resolution,
+          requestUrl: requestForResolutionUrl,
+          manifest,
+        });
+      if (canonicalNextDataRedirectUrl) {
+        middlewareRequestHeaders = null;
+        middlewareRewriteUrl = null;
+        middlewareResponseHeaders = null;
+        middlewareResponsePayload = null;
+        unresolvedResolution = await resolveRoutes({
+          url: canonicalNextDataRedirectUrl,
+          buildId: manifest.build.buildId,
+          basePath: manifest.build.basePath,
+          requestBody: createEmptyBodyStream(),
+          headers: new Headers(sanitizedRequestHeaders),
+          pathnames: manifest.pathnames,
+          i18n: toResolutionI18nConfig(manifest),
+          routes: routeGraph,
+          invokeMiddleware: invokeResolutionMiddleware,
+        });
+        resolution = stripMiddlewareResponse(
+          unresolvedResolution as unknown as JsonRecord
+        ) as ResolveRoutesResult;
       }
 
       if (resolution.redirect) {
@@ -3529,7 +4412,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           request,
           bunServer,
           new URL(resolution.externalRewrite.toString()),
-          new Headers(request.headers),
+          new Headers(middlewareRequestHeaders ?? sanitizedRequestHeaders),
           resolution,
           false
         );
@@ -3562,10 +4445,52 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         requestPathname: upstreamRequestUrl.pathname,
         basePath: manifest.build.basePath,
         i18n: manifest.build.i18n,
-        hasPrerenderRevalidateHeader: request.headers.has(
+        hasPrerenderRevalidateHeader: sanitizedRequestHeaders.has(
           'x-prerender-revalidate'
         ),
       });
+      const nextImageSourcePathname = resolveNextImageSourcePathname({
+        requestPathname: upstreamRequestUrl.pathname,
+        searchParams: upstreamRequestUrl.searchParams,
+        basePath: manifest.build.basePath,
+      });
+      const hasNextImageRouteOutput = getLookupPathnameCandidates(
+        '/_next/image',
+        manifest.build.basePath
+      ).some((candidatePathname) => routeOutputsByPathname.has(candidatePathname));
+      if (nextImageSourcePathname && !hasNextImageRouteOutput) {
+        const nextImageSourceAsset = resolveStaticAssetForPathname({
+          pathname: nextImageSourcePathname,
+          basePath: manifest.build.basePath,
+          staticAssetsByPathname,
+        });
+        if (
+          nextImageSourceAsset &&
+          canServeStaticAssetDirectly(nextImageSourceAsset, routeGraph)
+        ) {
+          const nextImageFallbackResponse = serveStaticAsset(
+            request,
+            adapterDir,
+            nextImageSourceAsset,
+            routeGraph
+          );
+          const nextImageFallbackResolution =
+            literalStatusOverride !== null
+              ? ({
+                  ...resolution,
+                  status: literalStatusOverride,
+                } satisfies ResolveRoutesResult)
+              : resolution;
+          return sanitizeProxyResponse(
+            applyResolutionToResponse(
+              nextImageFallbackResponse,
+              nextImageFallbackResolution,
+              literalStatusOverride ?? undefined
+            ),
+            request
+          );
+        }
+      }
 
       const resolvedResolutionPathname = resolveResolutionPathname(resolution);
       const concreteResolvedPathname = resolveConcretePathnameFromRouteMatches(
@@ -3577,18 +4502,62 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         (routeOutputsByPathname.has(concreteResolvedPathname) ||
           staticAssetsByPathname.has(concreteResolvedPathname) ||
           prerenderArtifactsByPathname.has(concreteResolvedPathname));
+      let routeGraphDestinationPathname =
+        !hasConcreteResolvedPathname && !resolvedResolutionPathname
+          ? extractRouteGraphDestinationPathname({
+              requestUrl: upstreamRequestUrl,
+              requestHeaders: middlewareRequestHeaders ?? sanitizedRequestHeaders,
+              routeGraph,
+              routeOutputsByPathname,
+              staticAssetsByPathname,
+              prerenderArtifactsByPathname,
+              basePath: manifest.build.basePath,
+            })
+          : null;
+      if (
+        !routeGraphDestinationPathname &&
+        !hasConcreteResolvedPathname &&
+        !resolvedResolutionPathname
+      ) {
+        const localePrefixedPathname = maybePrefixDefaultLocalePathname({
+          pathname: upstreamRequestUrl.pathname,
+          basePath: manifest.build.basePath,
+          i18n: manifest.build.i18n,
+        });
+        if (localePrefixedPathname) {
+          const localePrefixedRequestUrl = new URL(upstreamRequestUrl.toString());
+          localePrefixedRequestUrl.pathname = localePrefixedPathname;
+          routeGraphDestinationPathname = extractRouteGraphDestinationPathname({
+            requestUrl: localePrefixedRequestUrl,
+            requestHeaders: middlewareRequestHeaders ?? sanitizedRequestHeaders,
+            routeGraph,
+            routeOutputsByPathname,
+            staticAssetsByPathname,
+            prerenderArtifactsByPathname,
+            basePath: manifest.build.basePath,
+          });
+        }
+      }
       const resolutionPathnameForRouting =
         hasConcreteResolvedPathname
           ? concreteResolvedPathname
-          : resolvedResolutionPathname;
+          : resolvedResolutionPathname ?? routeGraphDestinationPathname;
       const requestedResolutionPathname = normalizeIndexPathnameAlias(
         resolutionPathnameForRouting,
         routeOutputsByPathname,
         staticAssetsByPathname,
         prerenderArtifactsByPathname
       );
+      const isNextDataRequest = isNextDataRequestPath({
+        request,
+        manifest,
+      });
+      const isNextDataPathRequest = isNextDataPathname(
+        upstreamRequestUrl.pathname,
+        manifest
+      );
       const nextDataMatchedPathname =
-        !requestedResolutionPathname
+        !requestedResolutionPathname && isNextDataRequest
           ? normalizeIndexPathnameAlias(
               maybeResolveNextDataMatchedPathname({
                 request,
@@ -3601,6 +4570,31 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
               prerenderArtifactsByPathname
             )
           : null;
+      if (isNextDataRequest && !requestedResolutionPathname && nextDataMatchedPathname) {
+        const normalizedDataRewritePathname = resolveNextDataPathnameFromPagePathname(
+          nextDataMatchedPathname,
+          manifest
+        );
+        const normalizedResolvedHeaders = new Headers(
+          resolution.resolvedHeaders ?? undefined
+        );
+        normalizedResolvedHeaders.set(
+          'x-middleware-rewrite',
+          normalizedDataRewritePathname
+        );
+        normalizedResolvedHeaders.set(
+          'x-nextjs-rewrite',
+          normalizedDataRewritePathname
+        );
+        resolution = {
+          ...resolution,
+          resolvedHeaders: normalizedResolvedHeaders,
+        };
+        middlewareRewriteUrl = new URL(
+          normalizedDataRewritePathname,
+          upstreamRequestUrl
+        ).toString();
+      }
       const effectiveMatchedPathname =
         nextDataMatchedPathname ||
         (requestedResolutionPathname
@@ -3618,10 +4612,26 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         staticAssetsByPathname,
         prerenderArtifactsByPathname
       );
+      const decodedRequestPathnameForStaticLookup = (() => {
+        const decodedPathname = decodePathnameSegmentsPreservingEncodedSlashes(
+          upstreamRequestUrl.pathname
+        );
+        return decodedPathname === upstreamRequestUrl.pathname
+          ? null
+          : decodedPathname;
+      })();
+      const hasEncodedSlashInRequestPathname = /%2f/i.test(
+        upstreamRequestUrl.pathname
+      );
 
       const matchedStaticAsset = normalizedEffectiveMatchedPathname
-        ? staticAssetsByPathname.get(normalizedEffectiveMatchedPathname)
-        : undefined;
+        ? staticAssetsByPathname.get(normalizedEffectiveMatchedPathname) ??
+          (decodedRequestPathnameForStaticLookup
+            ? staticAssetsByPathname.get(decodedRequestPathnameForStaticLookup)
+            : undefined)
+        : decodedRequestPathnameForStaticLookup
+          ? staticAssetsByPathname.get(decodedRequestPathnameForStaticLookup)
+          : undefined;
       const hasMatchedRouteOutput = normalizedEffectiveMatchedPathname
         ? routeOutputsByPathname.has(normalizedEffectiveMatchedPathname)
         : false;
@@ -3630,10 +4640,49 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         matchedStaticAsset.sourceType === 'prerender' &&
         isRscStaticAssetPath(matchedStaticAsset.pathname, routeGraph) &&
         hasInterceptionMarker(matchedStaticAsset.pathname);
+      const isPrerenderRevalidateRequest = request.headers.has(
+        'x-prerender-revalidate'
+      );
+      const shouldServePrerenderNextDataStaticAsset =
+        !!matchedStaticAsset &&
+        isNextDataPathRequest &&
+        request.method === 'GET' &&
+        !isPrerenderRevalidateRequest &&
+        matchedStaticAsset.sourceType === 'prerender';
+      const shouldServeDecodedPrerenderStaticAsset =
+        !!matchedStaticAsset &&
+        !!decodedRequestPathnameForStaticLookup &&
+        (request.method === 'GET' || request.method === 'HEAD') &&
+        matchedStaticAsset.sourceType === 'prerender';
+      const prerenderArtifact = normalizedEffectiveMatchedPathname
+        ? prerenderArtifactsByPathname.get(normalizedEffectiveMatchedPathname)
+        : undefined;
+      const shouldServeConcretePrerenderStaticAsset =
+        !!matchedStaticAsset &&
+        matchedStaticAsset.sourceType === 'prerender' &&
+        !!prerenderArtifact &&
+        prerenderArtifact.parentOutputId !== prerenderArtifact.pathname &&
+        (request.method === 'GET' || request.method === 'HEAD');
+      if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1' && isNextDataRequest) {
+        console.error('[adapter-bun] next-data static candidate', {
+          requestPathname: upstreamRequestUrl.pathname,
+          normalizedEffectiveMatchedPathname,
+          matchedStaticAssetPathname: matchedStaticAsset?.pathname ?? null,
+          matchedStaticAssetSourceType: matchedStaticAsset?.sourceType ?? null,
+          hasMatchedRouteOutput,
+          shouldServePrerenderNextDataStaticAsset,
+        });
+      }
       if (
         matchedStaticAsset &&
-        canServeStaticAssetDirectly(matchedStaticAsset, routeGraph) &&
-        (!hasMatchedRouteOutput || shouldPreferPrerenderRscStaticAsset)
+        (canServeStaticAssetDirectly(matchedStaticAsset, routeGraph) ||
+          shouldServePrerenderNextDataStaticAsset ||
+          shouldServeDecodedPrerenderStaticAsset ||
+          shouldServeConcretePrerenderStaticAsset) &&
+        !(hasEncodedSlashInRequestPathname && matchedStaticAsset.sourceType === 'prerender') &&
+        !(isPrerenderRevalidateRequest && matchedStaticAsset.sourceType === 'prerender') &&
+        (!hasMatchedRouteOutput ||
+          shouldPreferPrerenderRscStaticAsset)
       ) {
         const response = serveStaticAsset(
           request,
@@ -3641,6 +4690,15 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           matchedStaticAsset,
           routeGraph
         );
+        if (
+          shouldServePrerenderNextDataStaticAsset &&
+          !response.headers.has('cache-control')
+        ) {
+          response.headers.set(
+            'cache-control',
+            'public, max-age=0, must-revalidate'
+          );
+        }
         const staticAssetResolution =
           literalStatusOverride !== null
             ? ({
@@ -3658,9 +4716,6 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         );
       }
 
-      const prerenderArtifact = normalizedEffectiveMatchedPathname
-        ? prerenderArtifactsByPathname.get(normalizedEffectiveMatchedPathname)
-        : undefined;
       const hasExplicitRouteMatch = resolvedResolutionPathname !== null;
       let canUseDynamicRouteFallback = hasExplicitRouteMatch;
       if (!canUseDynamicRouteFallback && nextDataMatchedPathname) {
@@ -3677,6 +4732,38 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           });
         }
       }
+      if (!canUseDynamicRouteFallback && isNextDataRequest) {
+        const nextDataCandidatePathname = normalizeIndexPathnameAlias(
+          resolvePagePathnameFromNextDataPathname(
+            upstreamRequestUrl.pathname,
+            manifest
+          ),
+          routeOutputsByPathname,
+          staticAssetsByPathname,
+          prerenderArtifactsByPathname
+        );
+        if (nextDataCandidatePathname) {
+          let dynamicOutput = findDynamicOutputForPathname(
+            routeOutputs,
+            nextDataCandidatePathname,
+            prerenderFallbackFalseByPathname
+          );
+          if (!dynamicOutput) {
+            const localeStrippedNextDataPathname = stripLocaleFromPathname(
+              nextDataCandidatePathname,
+              manifest.build.i18n
+            );
+            if (localeStrippedNextDataPathname !== nextDataCandidatePathname) {
+              dynamicOutput = findDynamicOutputForPathname(
+                routeOutputs,
+                localeStrippedNextDataPathname,
+                prerenderFallbackFalseByPathname
+              );
+            }
+          }
+          canUseDynamicRouteFallback = Boolean(dynamicOutput);
+        }
+      }
 
       let routeOutput =
         (normalizedEffectiveMatchedPathname
@@ -3690,10 +4777,47 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         upstreamRequestUrl.pathname.startsWith('/api/');
       if (!routeOutput && !hasExplicitRouteMatch && isApiRequestPath) {
         routeOutput = findDynamicOutputForPathname(
-          manifest.routeOutputs,
+          routeOutputs,
           upstreamRequestUrl.pathname,
           prerenderFallbackFalseByPathname
         );
+      }
+
+      if (!routeOutput && canUseDynamicRouteFallback && isNextDataRequest) {
+        const nextDataDynamicOutputCandidatePathname =
+          (normalizedEffectiveMatchedPathname
+            ? resolvePagePathnameFromNextDataPathname(
+                normalizedEffectiveMatchedPathname,
+                manifest
+              )
+            : null) ??
+          resolvePagePathnameFromNextDataPathname(
+            upstreamRequestUrl.pathname,
+            manifest
+          );
+        if (nextDataDynamicOutputCandidatePathname) {
+          routeOutput = findDynamicOutputForPathname(
+            routeOutputs,
+            nextDataDynamicOutputCandidatePathname,
+            prerenderFallbackFalseByPathname
+          );
+          if (!routeOutput) {
+            const localeStrippedNextDataPagePathname = stripLocaleFromPathname(
+              nextDataDynamicOutputCandidatePathname,
+              manifest.build.i18n
+            );
+            if (
+              localeStrippedNextDataPagePathname !==
+              nextDataDynamicOutputCandidatePathname
+            ) {
+              routeOutput = findDynamicOutputForPathname(
+                routeOutputs,
+                localeStrippedNextDataPagePathname,
+                prerenderFallbackFalseByPathname
+              );
+            }
+          }
+        }
       }
 
       if (
@@ -3702,7 +4826,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         normalizedEffectiveMatchedPathname
       ) {
         routeOutput = findDynamicOutputForPathname(
-          manifest.routeOutputs,
+          routeOutputs,
           normalizedEffectiveMatchedPathname,
           prerenderFallbackFalseByPathname
         );
@@ -3714,7 +4838,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         requestedResolutionPathname
       ) {
         routeOutput = findDynamicOutputForPathname(
-          manifest.routeOutputs,
+          routeOutputs,
           requestedResolutionPathname,
           prerenderFallbackFalseByPathname
         );
@@ -3735,18 +4859,71 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         }
       }
 
+      const isPrerenderPageMethodNotAllowed =
+        !isNextDataRequest &&
+        request.method !== 'GET' &&
+        request.method !== 'HEAD' &&
+        routeOutput?.type === 'PAGES' &&
+        ((normalizedEffectiveMatchedPathname &&
+          (prerenderArtifactsByPathname.has(normalizedEffectiveMatchedPathname) ||
+            staticAssetsByPathname.get(normalizedEffectiveMatchedPathname)
+              ?.sourceType === 'prerender')) ||
+          false);
+      if (isPrerenderPageMethodNotAllowed) {
+        const methodNotAllowedResponse = new Response('Method Not Allowed', {
+          status: 405,
+          headers: {
+            allow: 'GET, HEAD',
+            'content-type': 'text/plain; charset=utf-8',
+          },
+        });
+        return sanitizeProxyResponse(
+          applyResolutionToResponse(methodNotAllowedResponse, resolution, 405),
+          request
+        );
+      }
+
+      const shouldBailMiddlewarePrefetch =
+        isNextDataRequest &&
+        request.headers.get('x-middleware-prefetch') === '1' &&
+        routeOutput?.type === 'PAGES' &&
+        !prerenderArtifact;
+      if (shouldBailMiddlewarePrefetch && routeOutput) {
+        const middlewarePrefetchHeaders = new Headers(
+          resolution.resolvedHeaders ?? undefined
+        );
+        middlewarePrefetchHeaders.set('x-nextjs-matched-path', routeOutput.pathname);
+        middlewarePrefetchHeaders.set('x-middleware-skip', '1');
+        middlewarePrefetchHeaders.set(
+          'cache-control',
+          'private, no-cache, no-store, max-age=0, must-revalidate'
+        );
+        middlewarePrefetchHeaders.set(
+          'content-type',
+          'application/json; charset=utf-8'
+        );
+        return sanitizeProxyResponse(
+          new Response('{}', {
+            status: 200,
+            headers: middlewarePrefetchHeaders,
+          }),
+          request
+        );
+      }
+
       const resolutionQuery = extractResolutionQuery(resolution);
-      const mergedSearchParams = new URLSearchParams(upstreamRequestUrl.searchParams);
+      let mergedSearchParams = new URLSearchParams(upstreamRequestUrl.searchParams);
       appendQueryObject(mergedSearchParams, resolutionQuery);
       appendQueryObject(
         mergedSearchParams,
         extractRouteGraphDestinationQuery({
           requestUrl: upstreamRequestUrl,
+          requestHeaders: middlewareRequestHeaders ?? request.headers,
           routeGraph,
         })
       );
       if (
-        (routeOutput?.type === 'PAGES' || routeOutput?.type === 'PAGES_API') &&
+        routeOutput?.type === 'PAGES_API' &&
         routeOutput.pathname.includes('[')
       ) {
         overwriteQueryObject(
@@ -3759,7 +4936,8 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           middlewareRewriteUrl,
           upstreamRequestUrl
         ).searchParams;
-        overwriteSearchParams(mergedSearchParams, middlewareRewriteSearchParams);
+        // Middleware rewrites provide the authoritative query string.
+        mergedSearchParams = new URLSearchParams(middlewareRewriteSearchParams);
       }
       let invocationPathname = resolveInvocationPathname({
         requestPathname: upstreamRequestUrl.pathname,
@@ -3782,6 +4960,27 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       ) {
         invocationPathname = upstreamRequestUrl.pathname;
       }
+      if (isNextDataRequest) {
+        if (routeOutput?.type === 'APP_PAGE' || routeOutput?.type === 'APP_ROUTE') {
+          invocationPathname = routeOutput.pathname;
+        } else {
+          invocationPathname = resolveNextDataInvocationPathname({
+            requestPathname: upstreamRequestUrl.pathname,
+            middlewareRewriteUrl,
+            requestedResolutionPathname,
+            upstreamRequestUrl,
+            manifest,
+          });
+        }
+      }
+      if (
+        routeOutput &&
+        routeOutput.pathname.includes('[') &&
+        decodedRequestPathnameForStaticLookup &&
+        invocationPathname === upstreamRequestUrl.pathname
+      ) {
+        invocationPathname = decodedRequestPathnameForStaticLookup;
+      }
       if (!routeOutput) {
         const invocationAliasPathname = normalizeIndexPathnameAlias(
           invocationPathname,
@@ -3794,12 +4993,15 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
             routeOutputsByPathname.get(invocationAliasPathname) ??
             (canUseDynamicRouteFallback
               ? findDynamicOutputForPathname(
-                  manifest.routeOutputs,
+                  routeOutputs,
                   invocationAliasPathname,
                   prerenderFallbackFalseByPathname
                 )
               : undefined);
         }
+      }
+      if (isNextDataRequest && routeOutput?.type === 'PAGES_API') {
+        routeOutput = undefined;
       }
       if (!routeOutput) {
         const invocationStaticPathname = normalizeIndexPathnameAlias(
@@ -3814,6 +5016,10 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
         if (
           invocationStaticAsset &&
           canServeStaticAssetDirectly(invocationStaticAsset, routeGraph) &&
+          !(
+            /%2f/i.test(invocationPathname) &&
+            invocationStaticAsset.sourceType === 'prerender'
+          ) &&
           !(invocationStaticPathname && routeOutputsByPathname.has(invocationStaticPathname))
         ) {
           const response = serveStaticAsset(
@@ -3870,10 +5076,49 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           request
         );
       }
+      if (
+        isNextDataRequest &&
+        routeOutput &&
+        (routeOutput.type === 'PAGES' || routeOutput.type === 'PAGES_API') &&
+        routeOutput.pathname.includes('[')
+      ) {
+        const invocationParamPathnameCandidates: string[] = [];
+        const nextDataInvocationPagePathname = resolvePagePathnameFromNextDataPathname(
+          invocationPathname,
+          manifest
+        );
+        if (nextDataInvocationPagePathname) {
+          invocationParamPathnameCandidates.push(nextDataInvocationPagePathname);
+          const localeStrippedPathname = stripLocaleFromPathname(
+            nextDataInvocationPagePathname,
+            manifest.build.i18n
+          );
+          if (localeStrippedPathname !== nextDataInvocationPagePathname) {
+            invocationParamPathnameCandidates.push(localeStrippedPathname);
+          }
+        } else {
+          invocationParamPathnameCandidates.push(invocationPathname);
+        }
+
+        for (const candidatePathname of invocationParamPathnameCandidates) {
+          const invocationPathParams = extractRouteParamsFromPathname(
+            routeOutput.pathname,
+            candidatePathname
+          );
+          if (!invocationPathParams) {
+            continue;
+          }
+          overwriteQueryObject(
+            mergedSearchParams,
+            routeParamsToQueryObject(invocationPathParams)
+          );
+          break;
+        }
+      }
       const mergedSearch = mergedSearchParams.toString();
       const invocationSourceHeaders = middlewareRequestHeaders
         ? new Headers(middlewareRequestHeaders)
-        : new Headers(request.headers);
+        : new Headers(sanitizedRequestHeaders);
       const isErrorFallback =
         !routeOutput &&
         literalStatusOverride === 500 &&
@@ -3889,17 +5134,49 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
       const fallbackStatusOverride =
         literalStatusOverride ??
         (isErrorFallback ? 500 : isNotFoundFallback ? 404 : null);
-      const invocationResolution =
+      let invocationResolution =
         fallbackStatusOverride !== null
           ? ({
               ...resolution,
               status: fallbackStatusOverride,
             } satisfies ResolveRoutesResult)
           : resolution;
+      if (isNextDataRequest && middlewareRewriteUrl) {
+        try {
+          const rewriteUrl = new URL(middlewareRewriteUrl, upstreamRequestUrl);
+          const rewrittenPagePathname =
+            resolvePagePathnameFromNextDataPathname(
+              rewriteUrl.pathname,
+              manifest
+            ) ?? rewriteUrl.pathname;
+          const rewriteValue = `${rewrittenPagePathname}${rewriteUrl.search}`;
+          const resolvedHeaders = new Headers(
+            invocationResolution.resolvedHeaders ?? undefined
+          );
+          if (
+            routeOutput &&
+            (routeOutput.type === 'APP_PAGE' || routeOutput.type === 'APP_ROUTE')
+          ) {
+            resolvedHeaders.set('x-nextjs-redirect', rewriteValue);
+            resolvedHeaders.delete('x-nextjs-rewrite');
+            resolvedHeaders.delete('x-middleware-rewrite');
+          } else if (!resolvedHeaders.has('x-nextjs-rewrite')) {
+            resolvedHeaders.set('x-nextjs-rewrite', rewriteValue);
+          }
+          invocationResolution = {
+            ...invocationResolution,
+            resolvedHeaders,
+          };
+        } catch {
+          // Ignore malformed middleware rewrite URLs and continue with
+          // unmodified resolution headers.
+        }
+      }
       if (!routeOutput && literalStatusOverride !== 500) {
         const notFoundStaticAsset = resolveNotFoundStaticAsset(
           staticAssetsByPathname,
-          manifest.build.basePath
+          manifest.build.basePath,
+          manifest.build.i18n
         );
         if (
           notFoundStaticAsset &&
@@ -3938,14 +5215,29 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           : undefined;
       const normalizedInvocationRouteMatches =
         normalizeResolutionRouteMatches(invocationRouteMatches);
+      const edgeInvocationParams =
+        routeOutput && routeOutput.pathname.includes('[')
+          ? mergeRouteParams(
+              normalizeRouteParams(
+                routeOutput.pathname,
+                invocationRouteMatches
+              ),
+              extractRouteParamsFromPathname(
+                routeOutput.pathname,
+                effectiveInvocationPathname
+              )
+            )
+          : undefined;
 
       if (process.env.ADAPTER_BUN_DEBUG_ROUTING === '1') {
         console.error('[adapter-bun] routing resolution', {
           requestPathname: upstreamRequestUrl.pathname,
+          isNextDataRequest,
           requestedResolutionPathname,
           normalizedEffectiveMatchedPathname,
           invocationPathname: effectiveInvocationPathname,
           routeOutputPathname: routeOutput?.pathname,
+          routeOutputType: routeOutput?.type,
           routeOutputRuntime: routeOutput?.runtime,
           resolutionRouteMatches: invocationRouteMatches ?? null,
           resolutionStatus: resolution.status ?? null,
@@ -3959,7 +5251,20 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           effectiveInvocationPathname,
           upstreamRequestUrl.origin
         );
-        invocationUrl.search = mergedSearch.length > 0 ? `?${mergedSearch}` : '';
+        const edgeInvocationSearchParams = new URLSearchParams(mergedSearchParams);
+        if (routeOutput.pathname.includes('[')) {
+          overwriteQueryObject(
+            edgeInvocationSearchParams,
+            routeMatchesToQueryObject(invocationRouteMatches)
+          );
+          overwriteQueryObject(
+            edgeInvocationSearchParams,
+            routeParamsToQueryObject(edgeInvocationParams)
+          );
+        }
+        const edgeInvocationSearch = edgeInvocationSearchParams.toString();
+        invocationUrl.search =
+          edgeInvocationSearch.length > 0 ? `?${edgeInvocationSearch}` : '';
 
         const edgeRequestHeaders = new Headers(invocationSourceHeaders);
         const requestHostHeader = invocationSourceHeaders.get('host');
@@ -3998,17 +5303,31 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
                 ? 'prerender-parent'
                 : 'function',
             matchedPathname: normalizedEffectiveMatchedPathname ?? undefined,
-            routeMatches: normalizedInvocationRouteMatches,
-            query: searchParamsToQueryObject(mergedSearchParams),
+            routeMatches: invocationRouteMatches ?? undefined,
+            ...(edgeInvocationParams ? { params: edgeInvocationParams } : {}),
+            query: searchParamsToQueryObject(edgeInvocationSearchParams),
             resolvedPathname: requestedResolutionPathname ?? undefined,
           },
         });
 
+        let edgeResponse = normalizeEdgeResponseEncoding(
+          await toResponse(edgeResponseValue)
+        );
+        if (
+          shouldBufferEdgeResponseForCrawler(request) &&
+          edgeResponse.body !== null
+        ) {
+          const bufferedBody = await edgeResponse.arrayBuffer();
+          const bufferedHeaders = new Headers(edgeResponse.headers);
+          bufferedHeaders.set('content-length', String(bufferedBody.byteLength));
+          edgeResponse = new Response(bufferedBody, {
+            status: edgeResponse.status,
+            statusText: edgeResponse.statusText,
+            headers: bufferedHeaders,
+          });
+        }
         return sanitizeProxyResponse(
-          applyResolutionToResponse(
-            await toResponse(edgeResponseValue),
-            invocationResolution
-          ),
+          applyResolutionToResponse(edgeResponse, invocationResolution),
           request
         );
       }
@@ -4032,8 +5351,7 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
 
         const internalUrl = new URL(effectiveInvocationPathname, backendOrigin);
         internalUrl.search = mergedSearch.length > 0 ? `?${mergedSearch}` : '';
-
-        return proxyRequest(
+        const response = await proxyRequest(
           request,
           bunServer,
           internalUrl,
@@ -4042,6 +5360,61 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
           true,
           extraHeaders
         );
+        if (
+          response.status === 404 &&
+          (request.method === 'GET' || request.method === 'HEAD') &&
+          matchedStaticAsset &&
+          matchedStaticAsset.sourceType === 'prerender'
+        ) {
+          const prerenderFallbackResponse = serveStaticAsset(
+            request,
+            adapterDir,
+            matchedStaticAsset,
+            routeGraph
+          );
+          return sanitizeProxyResponse(
+            applyResolutionToResponse(prerenderFallbackResponse, invocationResolution),
+            request
+          );
+        }
+        const shouldRenderNotFoundFallback =
+          routeOutput.type === 'PAGES' &&
+          notFoundRouteOutput?.runtime === 'nodejs' &&
+          notFoundRouteOutput.pathname !== routeOutput.pathname &&
+          response.status === 404 &&
+          response.headers
+            .get('content-type')
+            ?.toLowerCase()
+            .startsWith('text/plain') === true &&
+          isDocumentNavigationRequest(request);
+        if (shouldRenderNotFoundFallback && notFoundRouteOutput) {
+          const notFoundHeaders = new Headers();
+          notFoundHeaders.set('x-bun-output-pathname', notFoundRouteOutput.pathname);
+          notFoundHeaders.set(
+            'x-bun-invoke-meta',
+            encodeRouteInvocationMeta({
+              originalUrl: upstreamRequestUrl.toString(),
+              resolvedPathname: requestedResolutionPathname ?? undefined,
+              source: 'not-found',
+            })
+          );
+          const notFoundInternalUrl = new URL(
+            notFoundRouteOutput.pathname,
+            backendOrigin
+          );
+          notFoundInternalUrl.search = mergedSearch.length > 0 ? `?${mergedSearch}` : '';
+          return proxyRequest(
+            request,
+            bunServer,
+            notFoundInternalUrl,
+            invocationSourceHeaders,
+            invocationResolution,
+            true,
+            notFoundHeaders
+          );
+        }
+
+        return response;
       }
 
       if (

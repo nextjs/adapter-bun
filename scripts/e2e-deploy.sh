@@ -70,6 +70,12 @@ export NEXT_DEPLOYMENT_ID="bun-adapter-${DEPLOY_RANDOM}"
 export VERCEL_IMMUTABLE_ASSET_TOKEN="$NEXT_DEPLOYMENT_ID"
 export IMMUTABLE_ASSET_TOKEN="$NEXT_DEPLOYMENT_ID"
 
+# Avoid external Google Fonts fetches during deploy tests in environments
+# where outbound access can be flaky or blocked.
+if [ -z "${NEXT_FONT_GOOGLE_MOCKED_RESPONSES:-}" ]; then
+  export NEXT_FONT_GOOGLE_MOCKED_RESPONSES="${ADAPTER_BUN_DIR}/test/google-font-mocked-responses.cjs"
+fi
+
 # Forward experimental feature flags from the test harness.
 if [ -n "${__NEXT_CACHE_COMPONENTS:-}" ]; then
   export NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS="${__NEXT_CACHE_COMPONENTS}"
