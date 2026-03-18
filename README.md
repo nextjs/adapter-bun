@@ -18,9 +18,7 @@ Point your `next.config.ts` at it:
 import type { NextConfig } from 'next';
 
 const config: NextConfig = {
-  experimental: {
-    adapterPath: require.resolve('adapter-bun'),
-  },
+  adapterPath: require.resolve('adapter-bun'),
 };
 
 export default config;
@@ -45,10 +43,13 @@ export default createBunAdapter({
   port: 3000,               // listen port (default: 3000)
   hostname: '0.0.0.0',      // bind address (default: '0.0.0.0')
   deploymentHost: 'app.example.com', // CSRF allow-list for Server Actions
+  cacheHandlerMode: 'http', // optional edge-safe cache transport over fetch
 });
 ```
 
 `deploymentHost` can also be set via the `BUN_ADAPTER_DEPLOYMENT_HOST` environment variable.
+
+Use `cacheHandlerMode: 'http'` when you need Next's cache handlers to be safe in Edge runtimes. In that mode the generated Bun server mounts an internal cache endpoint and the handlers talk to it over `fetch` instead of importing `bun:sqlite` directly.
 
 ## What it supports
 

@@ -37,6 +37,9 @@ export interface PrerenderRevalidateTarget {
 export interface PrerenderCacheStore {
   get(cacheKey: string): Promise<PrerenderCacheEntry | null> | PrerenderCacheEntry | null;
   set(cacheKey: string, entry: PrerenderCacheEntry): Promise<void> | void;
+  findByPrefix?(
+    cacheKeyPrefix: string
+  ): Promise<PrerenderCacheEntry[]> | PrerenderCacheEntry[];
   delete?(cacheKey: string): Promise<void> | void;
   acquireRevalidateLock?(
     cacheKey: string,

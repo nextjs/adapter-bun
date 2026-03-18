@@ -24,10 +24,19 @@ export const ADAPTER_NAME = 'bun';
 export const DEFAULT_BUN_ADAPTER_OUT_DIR = 'bun-dist';
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = '0.0.0.0';
+const DEFAULT_CACHE_HANDLER_MODE = 'sqlite';
+const DEFAULT_CACHE_ENDPOINT_PATH = '/_adapter/cache';
 const RUNTIME_NEXT_CONFIG_FILE = 'runtime-next-config.json';
 const CACHE_RUNTIME_MODULES = [
   'cache-handler.js',
+  'cache-handler-http.js',
+  'cache-http-client.js',
+  'cache-http-protocol.js',
+  'cache-http-server.js',
   'incremental-cache-handler.js',
+  'incremental-cache-codec.js',
+  'incremental-cache-handler-http.js',
+  'binary.js',
   'cache-store.js',
   'sqlite-cache.js',
   'isr.js',
@@ -58,6 +67,28 @@ function resolveOutDir(projectDir: string, configuredOutDir: string): string {
     return configuredOutDir;
   }
   return path.join(projectDir, configuredOutDir);
+}
+
+function resolveCacheHandlerMode(
+  options: BunAdapterOptions
+): 'sqlite' | 'http' {
+  return options.cacheHandlerMode ?? DEFAULT_CACHE_HANDLER_MODE;
+}
+
+function getRuntimeHandlerModuleNames(options: BunAdapterOptions): {
+  incremental: string;
+  useCache: string;
+} {
+  const mode = resolveCacheHandlerMode(options);
+  return mode === 'http'
+    ? {
+        incremental: 'incremental-cache-handler-http.js',
+        useCache: 'cache-handler-http.js',
+      }
+    : {
+        incremental: 'incremental-cache-handler.js',
+        useCache: 'cache-handler.js',
+      };
 }
 
 async function readPreviewProps(
@@ -118,6 +149,7 @@ function createRuntimeNextConfig(
   const configRecord = toJsonRecord(cloned);
   delete configRecord.outputFileTracingRoot;
   delete configRecord.cacheHandler;
+  delete configRecord.adapterPath;
 
   const cacheHandlersValue = configRecord.cacheHandlers;
   if (cacheHandlersValue && typeof cacheHandlersValue === 'object') {
@@ -148,9 +180,18 @@ async function writeRuntimeNextConfig(
   await writeJsonFile(path.join(outDir, RUNTIME_NEXT_CONFIG_FILE), runtimeNextConfig);
 }
 
-const SERVER_ENTRY_TEMPLATE = `import path from 'node:path';
+function createServerEntryTemplate(options: BunAdapterOptions): string {
+  const handlerModules = getRuntimeHandlerModuleNames(options);
+  const cacheHandlerMode = resolveCacheHandlerMode(options);
+  const cacheEndpointPath =
+    options.cacheEndpointPath ?? DEFAULT_CACHE_ENDPOINT_PATH;
+  const cacheAuthToken = options.cacheAuthToken ?? '';
+
+  return `import path from 'node:path';
 import http from 'node:http';
 import { Readable } from 'node:stream';
+import { getSharedPrerenderCacheStore } from './runtime/cache-store.js';
+import { handleCacheHttpRequest } from './runtime/cache-http-server.js';
 
 const adapterDir = import.meta.dirname;
 const manifestPath = path.join(adapterDir, 'deployment-manifest.json');
@@ -187,6 +228,19 @@ const protocol = process.env.__NEXT_EXPERIMENTAL_HTTPS === '1' ? 'https' : 'http
 // Next's forwarded action/redirect fetches rely on this internal origin.
 process.env.__NEXT_PRIVATE_ORIGIN = protocol + '://' + appHostname + ':' + port;
 
+const cacheHandlerMode = ${JSON.stringify(cacheHandlerMode)};
+const internalCacheEndpointPath = ${JSON.stringify(cacheEndpointPath)};
+const configuredCacheAuthToken = ${JSON.stringify(cacheAuthToken)};
+if (cacheHandlerMode === 'http') {
+  const cacheAuthToken =
+    process.env.BUN_ADAPTER_CACHE_HTTP_TOKEN ||
+    configuredCacheAuthToken ||
+    crypto.randomUUID();
+  process.env.BUN_ADAPTER_CACHE_HTTP_TOKEN = cacheAuthToken;
+  process.env.BUN_ADAPTER_CACHE_HTTP_URL =
+    process.env.__NEXT_PRIVATE_ORIGIN + internalCacheEndpointPath;
+}
+
 async function loadRuntimeNextConfig() {
   const runtimeNextConfigPath = path.join(
     adapterDir,
@@ -217,12 +271,12 @@ async function loadRuntimeNextConfig() {
   const runtimeCacheHandlerPath = path.join(
     adapterDir,
     'runtime',
-    'incremental-cache-handler.js'
+    ${JSON.stringify(handlerModules.incremental)}
   );
   const runtimeRemoteCacheHandlerPath = path.join(
     adapterDir,
     'runtime',
-    'cache-handler.js'
+    ${JSON.stringify(handlerModules.useCache)}
   );
   const existingCacheHandlers =
     configRecord.cacheHandlers && typeof configRecord.cacheHandlers === 'object'
@@ -430,6 +484,17 @@ const server = http.createServer(async (req, res) => {
   // Normalize Bun's incoming headers into a plain mutable object so Next can
   // safely patch/strip headers during RSC/action flows.
   req.headers = { ...req.headers };
+
+  if (cacheHandlerMode === 'http') {
+    const requestUrl = new URL(req.url || '/', process.env.__NEXT_PRIVATE_ORIGIN);
+    if (requestUrl.pathname === internalCacheEndpointPath) {
+      await handleCacheHttpRequest(req, res, getSharedPrerenderCacheStore(), {
+        authToken: process.env.BUN_ADAPTER_CACHE_HTTP_TOKEN,
+      });
+      return;
+    }
+  }
+
   patchCacheControlHeader(req, res);
 
   const userAgent =
@@ -487,9 +552,13 @@ if (isWildcardHostname(listenHostname)) {
   server.listen(port, listenHostname, handleListening);
 }
 `;
+}
 
-async function writeServerEntry(outDir: string): Promise<void> {
-  await writeTextFile(path.join(outDir, 'server.js'), SERVER_ENTRY_TEMPLATE);
+async function writeServerEntry(
+  outDir: string,
+  options: BunAdapterOptions
+): Promise<void> {
+  await writeTextFile(path.join(outDir, 'server.js'), createServerEntryTemplate(options));
 }
 
 async function copyRuntimeModule(
@@ -736,7 +805,7 @@ async function onBuildComplete(
     repoRoot: ctx.repoRoot,
   });
   await writeRuntimeNextConfig(outDir, ctx.config);
-  await writeServerEntry(outDir);
+  await writeServerEntry(outDir, options);
 }
 
 export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
@@ -767,12 +836,13 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
         ? [...new Set([...existingAllowedOrigins, deploymentHost])]
         : existingAllowedOrigins;
 
-      // Inject SQLite-backed handlers for both Next.js cache APIs:
+      // Inject handlers for both Next.js cache APIs:
       // 1) nextConfig.cacheHandler (IncrementalCache handler class)
       // 2) nextConfig.cacheHandlers.default/remote (cacheComponents handlers)
       const existingCacheHandlers = configRecord.cacheHandlers as
         | Record<string, string | undefined>
         | undefined;
+      const handlerModules = getRuntimeHandlerModuleNames(options);
 
       // Stage the cache handler runtime into the output dir so the path is
       // inside the project tree (Turbopack rejects absolute paths that leave
@@ -789,12 +859,12 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
       const useCacheHandlerPath = path.resolve(
         configuredOutDir,
         'runtime',
-        'cache-handler.js'
+        handlerModules.useCache
       );
       const incrementalCacheHandlerPath = path.resolve(
         configuredOutDir,
         'runtime',
-        'incremental-cache-handler.js'
+        handlerModules.incremental
       );
 
       const cacheHandlersConfig: Record<string, string | undefined> = {

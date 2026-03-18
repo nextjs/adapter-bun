@@ -22,6 +22,22 @@ export interface BunAdapterOptions {
    * (for example `app.example.com` or `https://app.example.com`).
    */
   deploymentHost?: string;
+  /**
+   * Cache transport used by Next's cache handlers. `sqlite` is the default and
+   * reads the Bun-local SQLite database directly. `http` uses fetch against an
+   * Bun-owned cache endpoint and is safe to execute in Edge runtimes.
+   */
+  cacheHandlerMode?: 'sqlite' | 'http';
+  /**
+   * Internal path used when `cacheHandlerMode` is `http`.
+   */
+  cacheEndpointPath?: string;
+  /**
+   * Shared secret for the internal cache endpoint. If omitted in `http` mode,
+   * the Bun server generates a random token at startup and injects it into the
+   * runtime environment for the cache handlers.
+   */
+  cacheAuthToken?: string;
 }
 
 export interface BunStaticAsset {
