@@ -43,13 +43,13 @@ export default createBunAdapter({
   port: 3000,               // listen port (default: 3000)
   hostname: '0.0.0.0',      // bind address (default: '0.0.0.0')
   deploymentHost: 'app.example.com', // CSRF allow-list for Server Actions
-  cacheHandlerMode: 'http', // optional edge-safe cache transport over fetch
+  cacheHandlerMode: 'http', // default; edge-safe cache transport over fetch
 });
 ```
 
 `deploymentHost` can also be set via the `BUN_ADAPTER_DEPLOYMENT_HOST` environment variable.
 
-Use `cacheHandlerMode: 'http'` when you need Next's cache handlers to be safe in Edge runtimes. In that mode the generated Bun server mounts an internal cache endpoint and the handlers talk to it over `fetch` instead of importing `bun:sqlite` directly.
+`cacheHandlerMode` defaults to `http`. In that mode the generated Bun server mounts an internal cache endpoint and the handlers talk to it over `fetch` instead of importing `bun:sqlite` directly inside Edge bundles. Set `cacheHandlerMode: 'sqlite'` only if you explicitly want direct Bun-local SQLite access.
 
 ## What it supports
 

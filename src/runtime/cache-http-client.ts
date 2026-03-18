@@ -47,6 +47,44 @@ function resolveEndpointUrl(explicitUrl?: string): string {
   );
 }
 
+function tryResolveEndpointUrl(explicitUrl?: string): string | null {
+  try {
+    return resolveEndpointUrl(explicitUrl);
+  } catch {
+    return null;
+  }
+}
+
+let fallbackStorePromise: Promise<PrerenderCacheStore> | null = null;
+
+async function loadFallbackStore(): Promise<PrerenderCacheStore> {
+  if (!fallbackStorePromise) {
+    const dynamicImport = new Function(
+      'specifier',
+      'return import(specifier)'
+    ) as (specifier: string) => Promise<{
+      getSharedPrerenderCacheStore: () => PrerenderCacheStore;
+    }>;
+
+    fallbackStorePromise = dynamicImport(
+      new URL('./cache-store.js', import.meta.url).href
+    ).then((mod) => mod.getSharedPrerenderCacheStore());
+  }
+
+  return fallbackStorePromise;
+}
+
+function getTransportFetch(): typeof fetch {
+  const candidate = globalThis.fetch as
+    | (typeof fetch & { _nextOriginalFetch?: typeof fetch })
+    | undefined;
+  if (!candidate) {
+    throw new Error('[adapter-bun] global fetch is not available');
+  }
+
+  return candidate._nextOriginalFetch ?? candidate;
+}
+
 async function parseJsonResponse(response: Response): Promise<CacheHttpResponse> {
   try {
     return (await response.json()) as CacheHttpResponse;
@@ -59,17 +97,18 @@ async function parseJsonResponse(response: Response): Promise<CacheHttpResponse>
 }
 
 export class FetchPrerenderCacheStore implements PrerenderCacheStore {
-  readonly #url: string;
+  readonly #configuredUrl: string | undefined;
   readonly #authToken: string | undefined;
 
   constructor(options: FetchPrerenderCacheStoreOptions = {}) {
-    this.#url = resolveEndpointUrl(options.url);
+    this.#configuredUrl = options.url;
     this.#authToken =
       options.authToken ?? readRuntimeEnv('BUN_ADAPTER_CACHE_HTTP_TOKEN');
   }
 
   async #request(payload: CacheHttpRequest): Promise<CacheHttpResponse> {
-    const response = await fetch(this.#url, {
+    const endpointUrl = resolveEndpointUrl(this.#configuredUrl);
+    const response = await getTransportFetch()(endpointUrl, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -96,6 +135,12 @@ export class FetchPrerenderCacheStore implements PrerenderCacheStore {
   }
 
   async get(cacheKey: string): Promise<PrerenderCacheEntry | null> {
+    const endpointUrl = tryResolveEndpointUrl(this.#configuredUrl);
+    if (!endpointUrl) {
+      const fallbackStore = await loadFallbackStore();
+      return (await fallbackStore.get(cacheKey)) ?? null;
+    }
+
     const response = await this.#request({
       op: 'getEntry',
       cacheKey,
@@ -107,6 +152,13 @@ export class FetchPrerenderCacheStore implements PrerenderCacheStore {
   }
 
   async set(cacheKey: string, entry: PrerenderCacheEntry): Promise<void> {
+    const endpointUrl = tryResolveEndpointUrl(this.#configuredUrl);
+    if (!endpointUrl) {
+      const fallbackStore = await loadFallbackStore();
+      await fallbackStore.set(cacheKey, entry);
+      return;
+    }
+
     await this.#request({
       op: 'setEntry',
       cacheKey,
@@ -115,6 +167,14 @@ export class FetchPrerenderCacheStore implements PrerenderCacheStore {
   }
 
   async findByPrefix(cacheKeyPrefix: string): Promise<PrerenderCacheEntry[]> {
+    const endpointUrl = tryResolveEndpointUrl(this.#configuredUrl);
+    if (!endpointUrl) {
+      const fallbackStore = await loadFallbackStore();
+      return fallbackStore.findByPrefix
+        ? await fallbackStore.findByPrefix(cacheKeyPrefix)
+        : [];
+    }
+
     const response = await this.#request({
       op: 'findByPrefix',
       cacheKeyPrefix,
@@ -132,6 +192,14 @@ export class FetchPrerenderCacheStore implements PrerenderCacheStore {
       return {};
     }
 
+    const endpointUrl = tryResolveEndpointUrl(this.#configuredUrl);
+    if (!endpointUrl) {
+      const fallbackStore = await loadFallbackStore();
+      return fallbackStore.getTagManifestEntries
+        ? await fallbackStore.getTagManifestEntries(tags)
+        : {};
+    }
+
     const response = await this.#request({
       op: 'getTagManifestEntries',
       tags,
@@ -145,6 +213,15 @@ export class FetchPrerenderCacheStore implements PrerenderCacheStore {
     update: PrerenderTagManifestUpdate
   ): Promise<void> {
     if (tags.length === 0) {
+      return;
+    }
+
+    const endpointUrl = tryResolveEndpointUrl(this.#configuredUrl);
+    if (!endpointUrl) {
+      const fallbackStore = await loadFallbackStore();
+      if (fallbackStore.updateTagManifest) {
+        await fallbackStore.updateTagManifest(tags, update);
+      }
       return;
     }
 

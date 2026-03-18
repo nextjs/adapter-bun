@@ -23,9 +23,9 @@ export interface BunAdapterOptions {
    */
   deploymentHost?: string;
   /**
-   * Cache transport used by Next's cache handlers. `sqlite` is the default and
-   * reads the Bun-local SQLite database directly. `http` uses fetch against an
-   * Bun-owned cache endpoint and is safe to execute in Edge runtimes.
+   * Cache transport used by Next's cache handlers. `http` is the default and
+   * uses fetch against a Bun-owned cache endpoint so Edge runtimes avoid direct
+   * Node/Bun storage imports. `sqlite` forces direct Bun-local SQLite access.
    */
   cacheHandlerMode?: 'sqlite' | 'http';
   /**
