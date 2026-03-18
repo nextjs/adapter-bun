@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "adapter-bun": "file:../..",
-    "next": "16.2.0-canary.35",
+    "next": "16.2.0",
     "react": "19.1.0",
     "react-dom": "19.1.0"
   },

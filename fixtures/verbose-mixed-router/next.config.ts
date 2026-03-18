@@ -9,11 +9,9 @@ const require = createRequire(import.meta.url);
 const adapterPath = require.resolve('adapter-bun');
 
 const config: NextConfig = {
+  adapterPath,
   turbopack: {
     root: fixtureRoot,
-  },
-  experimental: {
-    adapterPath,
   },
   images: {
     path: '/_next/image',
