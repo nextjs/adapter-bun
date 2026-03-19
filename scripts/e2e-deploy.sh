@@ -16,6 +16,33 @@ fi
 ADAPTER_BUN_DIR="$(cd "$ADAPTER_BUN_DIR" && pwd -P)"
 export ADAPTER_BUN_DIR
 ADAPTER_BUN_DIST_INDEX="${ADAPTER_BUN_DIR}/dist/index.js"
+ADAPTER_PACK_LOCK_DIR="${ADAPTER_BUN_DIR}/.e2e-deploy-pack.lock"
+adapter_pack_lock_acquired=0
+
+cleanup_adapter_pack_lock() {
+  if [ "$adapter_pack_lock_acquired" -eq 1 ]; then
+    rmdir "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null || true
+    adapter_pack_lock_acquired=0
+  fi
+}
+
+trap cleanup_adapter_pack_lock EXIT
+
+# Multiple deploy tests run in parallel and share ADAPTER_BUN_DIR.
+# Serialize pack/build access so one test cannot remove dist while another
+# is packing or resolving NEXT_ADAPTER_PATH.
+for _attempt in $(seq 1 300); do
+  if mkdir "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null; then
+    adapter_pack_lock_acquired=1
+    break
+  fi
+  sleep 0.1
+done
+
+if [ "$adapter_pack_lock_acquired" -ne 1 ]; then
+  echo "Timed out waiting for adapter pack lock: ${ADAPTER_PACK_LOCK_DIR}" >&2
+  exit 1
+fi
 
 # Test jobs restore adapter-bun from cache. If dist artifacts are missing,
 # rebuild in-place so NEXT_ADAPTER_PATH always points at a valid module.
@@ -45,6 +72,7 @@ PACK_RESULT="$(
 ADAPTER_BUN_TARBALL="$NEXT_TEST_DIR/$(
   node -e "const result = JSON.parse(process.argv[1]); console.log(result[0].filename)" "$PACK_RESULT"
 )"
+cleanup_adapter_pack_lock
 
 # 3. Add adapter-bun as dependency
 node -e "
@@ -67,7 +95,12 @@ if [ -d "node_modules/@types/bun" ]; then
 fi
 
 # 5. Set adapter path
-export NEXT_ADAPTER_PATH="$ADAPTER_BUN_DIST_INDEX"
+NEXT_ADAPTER_PATH_LOCAL="${NEXT_TEST_DIR}/node_modules/adapter-bun/dist/index.js"
+if [ ! -f "$NEXT_ADAPTER_PATH_LOCAL" ]; then
+  echo "Installed adapter dist missing: ${NEXT_ADAPTER_PATH_LOCAL}" >&2
+  exit 1
+fi
+export NEXT_ADAPTER_PATH="$NEXT_ADAPTER_PATH_LOCAL"
 # Next's deploy harness aliases NEXT_PRIVATE_TEST_MODE -> __NEXT_TEST_MODE
 # in next.config.js for test-only hydration markers. Ensure it's set so
 # browser hydration waits don't fall back to a 10s timeout per navigation.
