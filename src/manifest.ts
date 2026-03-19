@@ -41,6 +41,7 @@ export function buildDeploymentManifest({
   port,
   hostname,
   previewProps,
+  cacheRuntime,
 }: {
   adapterName: string;
   adapterOutDir: string;
@@ -50,11 +51,8 @@ export function buildDeploymentManifest({
   staticAssets: BunStaticAsset[];
   port: number;
   hostname: string;
-  previewProps?: BunDeploymentManifest['runtime'] extends infer Runtime
-    ? Runtime extends { previewProps?: infer Preview }
-      ? Preview
-      : never
-    : never;
+  previewProps?: NonNullable<BunDeploymentManifest['runtime']>['previewProps'];
+  cacheRuntime?: NonNullable<BunDeploymentManifest['runtime']>['cache'];
 }): BunDeploymentManifest {
   return {
     schemaVersion: 1,
@@ -80,6 +78,7 @@ export function buildDeploymentManifest({
     pathnames,
     runtime: {
       previewProps: previewProps ?? null,
+      cache: cacheRuntime ?? null,
     },
     staticAssets,
     summary: {

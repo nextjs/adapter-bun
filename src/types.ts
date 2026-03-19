@@ -79,6 +79,11 @@ export interface BunDeploymentManifest {
       previewModeSigningKey: string;
       previewModeEncryptionKey: string;
     } | null;
+    cache?: {
+      handlerMode: 'sqlite' | 'http';
+      endpointPath: string;
+      authToken: string | null;
+    } | null;
   };
   staticAssets: BunStaticAsset[];
   summary: {
