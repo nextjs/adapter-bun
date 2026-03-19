@@ -193,7 +193,14 @@ function createRuntimeCacheConfig(options: BunAdapterOptions): CacheRuntimeConfi
 
 async function writeServerEntry(outDir: string): Promise<void> {
   const sourcePath = path.join(import.meta.dirname, 'runtime', 'server.js');
-  await Bun.write(path.join(outDir, 'server.js'), Bun.file(sourcePath));
+  const sourceCode = await Bun.file(sourcePath).text();
+  const runtimeServerCode = sourceCode
+    .replace("from './cache-store.js';", "from './runtime/cache-store.js';")
+    .replace(
+      "from './cache-http-server.js';",
+      "from './runtime/cache-http-server.js';"
+    );
+  await Bun.write(path.join(outDir, 'server.js'), runtimeServerCode);
 }
 
 async function copyRuntimeModule(
