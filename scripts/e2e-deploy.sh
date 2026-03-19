@@ -3,6 +3,36 @@ set -euo pipefail
 
 cd "$NEXT_TEST_DIR"
 
+if [ -z "${ADAPTER_BUN_DIR:-}" ]; then
+  echo "ADAPTER_BUN_DIR is not set" >&2
+  exit 1
+fi
+
+if [ ! -d "$ADAPTER_BUN_DIR" ]; then
+  echo "ADAPTER_BUN_DIR does not exist: $ADAPTER_BUN_DIR" >&2
+  exit 1
+fi
+
+ADAPTER_BUN_DIR="$(cd "$ADAPTER_BUN_DIR" && pwd -P)"
+export ADAPTER_BUN_DIR
+ADAPTER_BUN_DIST_INDEX="${ADAPTER_BUN_DIR}/dist/index.js"
+
+# Test jobs restore adapter-bun from cache. If dist artifacts are missing,
+# rebuild in-place so NEXT_ADAPTER_PATH always points at a valid module.
+if [ ! -f "$ADAPTER_BUN_DIST_INDEX" ]; then
+  echo "Adapter dist missing at ${ADAPTER_BUN_DIST_INDEX}; rebuilding adapter-bun..." >&2
+  (
+    cd "$ADAPTER_BUN_DIR"
+    bun install >&2
+    bun run build >&2
+  )
+fi
+
+if [ ! -f "$ADAPTER_BUN_DIST_INDEX" ]; then
+  echo "Adapter dist build failed; missing ${ADAPTER_BUN_DIST_INDEX}" >&2
+  exit 1
+fi
+
 # 1. Pick a random available port
 PORT=$(node -e "const s=require('net').createServer();s.listen(0,()=>{console.log(s.address().port);s.close()})")
 
@@ -37,7 +67,7 @@ if [ -d "node_modules/@types/bun" ]; then
 fi
 
 # 5. Set adapter path
-export NEXT_ADAPTER_PATH="${ADAPTER_BUN_DIR}/dist/index.js"
+export NEXT_ADAPTER_PATH="$ADAPTER_BUN_DIST_INDEX"
 # Next's deploy harness aliases NEXT_PRIVATE_TEST_MODE -> __NEXT_TEST_MODE
 # in next.config.js for test-only hydration markers. Ensure it's set so
 # browser hydration waits don't fall back to a 10s timeout per navigation.
