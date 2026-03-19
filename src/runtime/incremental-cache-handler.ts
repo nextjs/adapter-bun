@@ -1,4 +1,6 @@
 import type { PrerenderTagManifestUpdate } from './isr.js';
+import cacheHandler from './cache-handler.js';
+import { registerGlobalCacheHandlers } from './cache-handler-registration.js';
 import { getSharedPrerenderCacheStore } from './cache-store.js';
 import type {
   CacheHandler as NextIncrementalCacheHandler,
@@ -24,6 +26,8 @@ const KNOWN_CACHE_KINDS = new Set([
   'REDIRECT',
   'IMAGE',
 ]);
+
+registerGlobalCacheHandlers(cacheHandler);
 
 function normalizeTags(tags: string[]): string[] {
   const unique = new Set<string>();

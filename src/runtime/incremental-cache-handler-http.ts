@@ -1,4 +1,6 @@
 import { createFetchPrerenderCacheStore } from './cache-http-client.js';
+import cacheHandler from './cache-handler-http.js';
+import { registerGlobalCacheHandlers } from './cache-handler-registration.js';
 import type { PrerenderTagManifestUpdate } from './isr.js';
 import {
   decodeCacheValue,
@@ -24,6 +26,8 @@ import type {
 
 const SEGMENT_RSC_SUFFIX = '.segment.rsc';
 const store = createFetchPrerenderCacheStore();
+
+registerGlobalCacheHandlers(cacheHandler);
 
 function normalizeTags(tags: string[]): string[] {
   const unique = new Set<string>();

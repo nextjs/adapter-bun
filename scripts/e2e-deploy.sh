@@ -6,15 +6,25 @@ cd "$NEXT_TEST_DIR"
 # 1. Pick a random available port
 PORT=$(node -e "const s=require('net').createServer();s.listen(0,()=>{console.log(s.address().port);s.close()})")
 
-# 2. Add adapter-bun as file: dependency
+# 2. Pack adapter-bun and add it as a tarball dependency. Installing the raw
+# repo directory pulls fixture file: links into the temp app and can recurse.
+PACK_RESULT="$(
+  cd "$ADAPTER_BUN_DIR"
+  npm pack --json --ignore-scripts --pack-destination "$NEXT_TEST_DIR"
+)"
+ADAPTER_BUN_TARBALL="$NEXT_TEST_DIR/$(
+  node -e "const result = JSON.parse(process.argv[1]); console.log(result[0].filename)" "$PACK_RESULT"
+)"
+
+# 3. Add adapter-bun as dependency
 node -e "
 const pkg=JSON.parse(require('fs').readFileSync('package.json','utf8'));
 pkg.dependencies=pkg.dependencies||{};
-pkg.dependencies['adapter-bun']='file:${ADAPTER_BUN_DIR}';
+pkg.dependencies['adapter-bun']='file:${ADAPTER_BUN_TARBALL}';
 require('fs').writeFileSync('package.json',JSON.stringify(pkg,null,2));
 " >&2
 
-# 3. Install dependencies
+# 4. Install dependencies
 bun install --no-frozen-lockfile >&2
 
 # Bun type packages can conflict with Next.js global typings in fixtures
@@ -26,13 +36,7 @@ if [ -d "node_modules/@types/bun" ]; then
   rm -rf "node_modules/@types/bun"
 fi
 
-# Trim local-fixture trees from file:adapter installs. They are not needed for
-# deploy tests and can create ENAMETOOLONG paths during test cleanup.
-if [ -d "node_modules/adapter-bun/fixtures" ]; then
-  rm -rf "node_modules/adapter-bun/fixtures"
-fi
-
-# 4. Set adapter path
+# 5. Set adapter path
 export NEXT_ADAPTER_PATH="${ADAPTER_BUN_DIR}/dist/index.js"
 # Next's deploy harness aliases NEXT_PRIVATE_TEST_MODE -> __NEXT_TEST_MODE
 # in next.config.js for test-only hydration markers. Ensure it's set so
@@ -41,7 +45,7 @@ if [ -z "${NEXT_PRIVATE_TEST_MODE:-}" ] && [ -n "${NEXT_TEST_MODE:-}" ]; then
   export NEXT_PRIVATE_TEST_MODE="${NEXT_TEST_MODE}"
 fi
 
-# 5. Build (NEXT_ADAPTER_PATH tells Next.js to use our adapter).
+# 6. Build (NEXT_ADAPTER_PATH tells Next.js to use our adapter).
 # The Next.js test harness always wires a `build` script in package.json.
 # Execute that script, but force `next build` segments to run through Bun.
 : > "$NEXT_TEST_DIR/.adapter-build.log"
@@ -80,19 +84,19 @@ fi
 
 bash -lc "$BUILD_SCRIPT" 2>&1 | tee -a "$NEXT_TEST_DIR/.adapter-build.log" >&2
 
-# 6. Record build ID markers for logs script
+# 7. Record build ID markers for logs script
 BUILD_ID=$(cat ".next/BUILD_ID" 2>/dev/null || echo "unknown")
 echo "BUILD_ID: $BUILD_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
 echo "DEPLOYMENT_ID: $NEXT_DEPLOYMENT_ID" >> "$NEXT_TEST_DIR/.adapter-build.log"
 echo "IMMUTABLE_ASSET_TOKEN: $IMMUTABLE_ASSET_TOKEN" >> "$NEXT_TEST_DIR/.adapter-build.log"
 
-# 7. Start server on selected port
+# 8. Start server on selected port
 # Use bun (without --bun) for better Node.js API compatibility with Next.js internals
 PORT=$PORT NEXT_DEPLOYMENT_ID="$NEXT_DEPLOYMENT_ID" VERCEL_IMMUTABLE_ASSET_TOKEN="$VERCEL_IMMUTABLE_ASSET_TOKEN" IMMUTABLE_ASSET_TOKEN="$IMMUTABLE_ASSET_TOKEN" bun bun-dist/server.js >> "$NEXT_TEST_DIR/.adapter-server.log" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$NEXT_TEST_DIR/.adapter-server.pid"
 
-# 8. Wait for server to be ready.
+# 9. Wait for server to be ready.
 # Use a plain TCP probe instead of an HTTP route probe so middleware fixtures
 # are not exercised during readiness checks.
 server_ready=0
@@ -127,5 +131,5 @@ if [ "$server_ready" -ne 1 ]; then
   exit 1
 fi
 
-# 9. Output URL (only thing on stdout)
+# 10. Output URL (only thing on stdout)
 echo "http://localhost:${PORT}"

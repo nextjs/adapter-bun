@@ -9,7 +9,6 @@ import type {
 const CACHE_TAGS_HEADER = 'x-next-cache-tags';
 const CACHE_STALE_HEADER = 'x-next-cache-stale';
 const store = createFetchPrerenderCacheStore();
-
 const pendingSets = new Map<string, Promise<void>>();
 
 function readStoredTags(headers: Record<string, string>): string[] {
@@ -126,16 +125,15 @@ class FetchCacheHandler implements NextUseCacheHandler {
 
     try {
       const entry = await pendingEntry;
-      const reader = entry.value.getReader();
+      const [value, clonedValue] = entry.value.tee();
+      entry.value = value;
+
+      const reader = clonedValue.getReader();
       const chunks: Uint8Array[] = [];
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) chunks.push(value);
-        }
-      } catch {
-        return;
+      while (true) {
+        const { done, value: chunk } = await reader.read();
+        if (done) break;
+        if (chunk) chunks.push(chunk);
       }
 
       const totalLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
@@ -145,7 +143,6 @@ class FetchCacheHandler implements NextUseCacheHandler {
         combined.set(chunk, offset);
         offset += chunk.byteLength;
       }
-
       const createdAt = entry.timestamp ?? Date.now();
 
       await store.set(cacheKey, {
@@ -154,7 +151,9 @@ class FetchCacheHandler implements NextUseCacheHandler {
         groupId: 0,
         status: 200,
         headers: {
-          ...(entry.tags.length > 0 ? { [CACHE_TAGS_HEADER]: entry.tags.join(',') } : {}),
+          ...(entry.tags.length > 0
+            ? { [CACHE_TAGS_HEADER]: entry.tags.join(',') }
+            : {}),
           [CACHE_STALE_HEADER]: String(entry.stale),
         },
         body: combined,
@@ -165,6 +164,8 @@ class FetchCacheHandler implements NextUseCacheHandler {
         expiresAt:
           entry.expire > 0 ? createdAt + entry.expire * 1000 : null,
       });
+    } catch {
+      return;
     } finally {
       resolvePending();
       pendingSets.delete(cacheKey);

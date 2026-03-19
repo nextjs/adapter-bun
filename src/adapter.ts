@@ -30,6 +30,7 @@ const RUNTIME_NEXT_CONFIG_FILE = 'runtime-next-config.json';
 const CACHE_RUNTIME_MODULES = [
   'cache-handler.js',
   'cache-handler-http.js',
+  'cache-handler-registration.js',
   'cache-http-client.js',
   'cache-http-protocol.js',
   'cache-http-server.js',
@@ -497,15 +498,8 @@ const server = http.createServer(async (req, res) => {
 
   patchCacheControlHeader(req, res);
 
-  const userAgent =
-    typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
-  if (userAgent.includes('node-fetch')) {
-    // node-fetch@2 can reuse a keep-alive socket across mixed request methods
-    // and hit ECONNRESET against the Bun->Node bridge. Force connection close
-    // for its requests so each request gets a fresh socket.
-    req.headers.connection = 'close';
-    res.setHeader('connection', 'close');
-  }
+  req.headers.connection = 'close';
+  res.setHeader('connection', 'close');
 
   // Some Bun fetch requests use Accept: */* for RSC refetches. Force the
   // expected RSC accept header so Next serves Flight payloads instead of HTML.
@@ -530,6 +524,20 @@ const server = http.createServer(async (req, res) => {
     res.end('Internal Server Error');
   }
 });
+
+// The deploy test runner uses a shared keep-alive node-fetch agent.
+// Node's default keepAliveTimeout (5s) is too short and can reset pooled
+// sockets between requests, surfacing intermittent "socket hang up" errors.
+const requestedKeepAliveTimeout = Number.parseInt(
+  process.env.BUN_ADAPTER_KEEP_ALIVE_TIMEOUT || '',
+  10
+);
+const keepAliveTimeout =
+  Number.isFinite(requestedKeepAliveTimeout) && requestedKeepAliveTimeout > 0
+    ? requestedKeepAliveTimeout
+    : 75_000;
+server.keepAliveTimeout = keepAliveTimeout;
+server.headersTimeout = Math.max(server.headersTimeout, keepAliveTimeout + 1_000);
 
 const handleListening = () => {
   const addr = server.address();
@@ -836,12 +844,9 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
         ? [...new Set([...existingAllowedOrigins, deploymentHost])]
         : existingAllowedOrigins;
 
-      // Inject handlers for both Next.js cache APIs:
-      // 1) nextConfig.cacheHandler (IncrementalCache handler class)
-      // 2) nextConfig.cacheHandlers.default/remote (cacheComponents handlers)
-      const existingCacheHandlers = configRecord.cacheHandlers as
-        | Record<string, string | undefined>
-        | undefined;
+      // Inject the IncrementalCache handler. The module also registers the
+      // corresponding use-cache handler through Next's global cache symbol so
+      // Edge bundles do not need nextConfig.cacheHandlers imports injected.
       const handlerModules = getRuntimeHandlerModuleNames(options);
 
       // Stage the cache handler runtime into the output dir so the path is
@@ -856,21 +861,11 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
         const dest = path.join(runtimeDir, mod);
         copyFileSync(path.join(sourceDir, mod), dest);
       }
-      const useCacheHandlerPath = path.resolve(
-        configuredOutDir,
-        'runtime',
-        handlerModules.useCache
-      );
       const incrementalCacheHandlerPath = path.resolve(
         configuredOutDir,
         'runtime',
         handlerModules.incremental
       );
-
-      const cacheHandlersConfig: Record<string, string | undefined> = {
-        ...(existingCacheHandlers ?? {}),
-        remote: useCacheHandlerPath,
-      };
 
       return {
         ...config,
@@ -883,7 +878,6 @@ export function createBunAdapter(options: BunAdapterOptions = {}): NextAdapter {
             }
           : {}),
         cacheHandler: incrementalCacheHandlerPath,
-        cacheHandlers: cacheHandlersConfig,
         // Enable cacheComponents when the experimental flag is set via env.
         ...(process.env.__NEXT_CACHE_COMPONENTS === 'true' ||
         process.env.NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS === 'true'
