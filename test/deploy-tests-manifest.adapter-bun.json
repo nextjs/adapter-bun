@@ -7,7 +7,8 @@
       "test/e2e/app-dir/server-actions-redirect-middleware-rewrite/server-actions-redirect-middleware-rewrite.test.ts",
       "test/e2e/middleware-fetches-with-any-http-method/index.test.ts",
       "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts",
-      "test/e2e/edge-async-local-storage/index.test.ts"
+      "test/e2e/edge-async-local-storage/index.test.ts",
+      "test/e2e/app-dir/app-prefetch/prefetching.test.ts"
     ]
   }
 }
