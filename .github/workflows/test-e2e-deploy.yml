@@ -131,7 +131,7 @@ jobs:
         run: node run-tests.js --timings -g ${{ matrix.group }} -c 2 --type e2e
 
       - name: Upload adapter test result artifacts
-        if: ${{ always() }}
+        if: ${{ always() && github.ref == 'refs/heads/main' && (inputs.nextjsRef || 'canary') == 'canary' }}
         uses: actions/upload-artifact@v4
         with:
           name: adapter-test-reports-${{ replace(matrix.group, '/', '-') }}
@@ -142,7 +142,7 @@ jobs:
   upload-adapter-test-results:
     name: Upload adapter test results
     needs: [test]
-    if: ${{ always() && (inputs.nextjsRef || 'canary') == 'canary' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && (inputs.nextjsRef || 'canary') == 'canary' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
