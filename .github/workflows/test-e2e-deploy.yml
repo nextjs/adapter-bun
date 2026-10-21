@@ -34,7 +34,7 @@ jobs:
         with: { bun-version: "latest" }
 
       - name: Setup pnpm
-        run: npm i -g corepack@0.31 && corepack enable
+        run: npm i -g corepack@0.34.7 && corepack enable
 
       - name: Install & build Next.js
         working-directory: next.js
@@ -99,7 +99,7 @@ jobs:
         with: { bun-version: "latest" }
 
       - name: Setup pnpm
-        run: npm i -g corepack@0.31 && corepack enable
+        run: npm i -g corepack@0.34.7 && corepack enable
 
       - name: Ensure Playwright browser
         working-directory: next.js
